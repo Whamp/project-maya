@@ -356,11 +356,11 @@ inline bool resident_sampled(const void* p, size_t bytes, int samples = 8) {
     return true;
 #endif
 }
-/// Best-effort expert read-ahead governed by DS4_EXPERT_PREFETCH_MODE and DS4_EXPERT_PREFETCH_SAMPLES.
-/// Defaults stay always-hint on Linux and sampled on Windows. Missed cold pages still load on demand.
+/// Best-effort expert read-ahead: DS4_PF_SAMPLES=0 hints every range; 1-16 probes skip ranges that look warm.
+/// Defaults stay always-hint on Linux and eight probes on Windows. Missed cold pages still load on demand.
 inline void prefetch_cold(const std::vector<std::pair<const void*, size_t>>& ranges) {
     const auto& policy = expert_prefetch_policy();
-    if (policy.mode == ExpertPrefetchMode::Always) return prefetch(ranges);
+    if (policy.samples == 0) return prefetch(ranges);
     std::vector<std::pair<const void*, size_t>> cold;
     for (const auto& x : ranges)
         if (!resident_sampled(x.first, x.second, policy.samples)) cold.push_back(x);

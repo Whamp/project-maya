@@ -74,20 +74,16 @@ extern "C" int __wrap_madvise(void* address, size_t length, int advice) {
 int main(int argc, char** argv) {
     const bool legacy_all = argc == 2 && std::strcmp(argv[1], "--all") == 0;
     const bool legacy_zero = argc == 2 && std::strcmp(argv[1], "--legacy-zero") == 0;
-    const bool mode_all = argc == 2 && std::strcmp(argv[1], "--always") == 0;
     const bool override_all = argc == 2 && std::strcmp(argv[1], "--override") == 0;
     const bool default_mode = argc == 2 && std::strcmp(argv[1], "--default") == 0;
-    const bool samples_only = argc == 3 && std::strcmp(argv[1], "--samples-only") == 0;
-    const bool all = legacy_all || legacy_zero || mode_all || default_mode || samples_only;
     const int samples = argc == 3 ? std::atoi(argv[2]) : 4;
+    const bool all = legacy_all || legacy_zero || override_all || default_mode || samples == 0;
     unsetenv("DS4_PF_ALL");
-    unsetenv("DS4_EXPERT_PREFETCH_MODE");
-    unsetenv("DS4_EXPERT_PREFETCH_SAMPLES");
+    unsetenv("DS4_PF_SAMPLES");
     if (legacy_all || override_all) setenv("DS4_PF_ALL", "1", 1);
     if (legacy_zero) setenv("DS4_PF_ALL", "0", 1);
-    if (mode_all) setenv("DS4_EXPERT_PREFETCH_MODE", "always", 1);
-    if (!all) setenv("DS4_EXPERT_PREFETCH_MODE", "sampled", 1);
-    if (argc == 3) setenv("DS4_EXPERT_PREFETCH_SAMPLES", argv[2], 1);
+    if (!legacy_all && !legacy_zero && !default_mode)
+        setenv("DS4_PF_SAMPLES", argc == 3 ? argv[2] : "4", 1);
     const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     PrefetchMapping warm(3 * page), cold(2 * page);
     namespace os = strata::ds4::os;
