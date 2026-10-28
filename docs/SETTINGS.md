@@ -468,6 +468,20 @@ n = no drafting), or pass `--drafting on` / `--drafting off` (`--drafting measur
 measures). Your choice is kept in the config like a measured result, so a start does not measure by itself.
 `--no-speed-calibration` is the same as `--drafting on`.
 
+## DeepSeek: small-prompt path selection
+
+DeepSeek can read a small prompt through the streamed GPU flow or through repeated 16-token windows. It measures
+transfer and CPU rates at load, then updates its predictions from completed reads. Flow timing corrections stay within
+the size class that produced them: 2-31, 32-127, 128-511, or 512 and more tokens. An unmeasured class uses the initial
+calibration, so a slow tiny warm-up does not inflate a larger prompt's flow estimate. Windows remain available when
+predicted faster; reads of at least 2,048 new tokens use flow when that path is available.
+
+This learning is automatic. `./maya.sh --calibrate` separately tunes GPU grouping and CPU threads under the config's
+memory policy. The Models page's **Experts VRAM does not hold** choice remains unchanged: **Auto** copies them when
+they fit, **From the files** leaves them file-backed, and **In RAM** copies as many as the budget permits.
+`DS4_PATH_PICK=0` is a diagnostic override that selects flow and skips the startup path calibration. It is not needed
+to enable size-local feedback, and it is not a universal tuning recommendation.
+
 ## DeepSeek: the PCIe lane
 
 While answering, a token's routed experts that VRAM does not hold were all computed on the CPU (the CPU lane). Now,
