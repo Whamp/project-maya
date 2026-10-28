@@ -29,6 +29,7 @@
 #include "ds4_pcie.hpp"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_path_policy.hpp"
 #include "ds4_prefill_stats.hpp"
 #include "ds4_ram_slice.hpp"
 #include "ds4_vision.cuh"
@@ -1096,10 +1097,8 @@ struct Model::Impl {
     struct PathModel {
         bool on = false;
         double dma = 0, copy = 0, disk = 0, cpu = 0, cpu_cold = 0;   // bytes/s (disk, cpu_cold 0: not measured)
-        // the flow's taken / predicted so far [0] by the prompt's size class (2-31, 32-127, 128-511, 512 tokens and
-        // more: a short one's fixed costs weigh more), and how many prompts set it ([1] unused)
-        double k[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}};
-        int64_t kn[2][4] = {};
+        // the flow's taken / predicted so far by prompt-size class (a short one's fixed costs weigh more)
+        PathFlowCalibration flow;
         double win_s = 0;                                              // windows: seconds a window took, so far
         int64_t win_n = 0;
         int last_cls = 0, last_nw = 0;                                 // the last pick's size class, its windows
@@ -15482,7 +15481,7 @@ struct Model::Impl {
         // experts' bytes are in RAM: the flow wins on every PC whose experts come from an SSD, where a wrong pick would
         // cost the most; windows win where they are all in RAM)
         const double res_share = f_res / std::max(1.0, f_res + f_cold);
-        const bool flow = !(pw < pf && (res_share >= kPickRes || 2.0 * pw <= pf));
+        const bool flow = should_use_flow_path(pf, pw, res_share, kPickRes);
         pm.last = flow ? 1 : 0;
         pm.last_cls = cls;
         pm.last_nw = n_win;
@@ -15495,16 +15494,10 @@ struct Model::Impl {
                          100.0 * res_share, (f_res + f_cold) / 1e9);
         return flow;
     }
-    // a prompt's size class for pm.k: 2-31, 32-127, 128-511, 512 tokens and more
-    static int pm_cls(int n) { return n < 32 ? 0 : n < 128 ? 1 : n < 512 ? 2 : 3; }
-    // the flow's time factor for size class c: its own, else its nearest class's, else 1 (never the windows': theirs
-    // is mostly the fixed costs a window pays again and again)
-    double pm_k(int c) const {
-        for (int dc = 0; dc < 4; ++dc)
-            for (int cc : {c - dc, c + dc})
-                if (cc >= 0 && cc < 4 && pm.kn[0][cc] > 0) return pm.k[0][cc];
-        return 1.0;
-    }
+    // a prompt's size class for pm.flow: 2-31, 32-127, 128-511, 512 tokens and more
+    static int pm_cls(int n) { return path_size_class(n); }
+    // The flow factor is learned only within the prompt's own size class; an unmeasured class stays at one.
+    double pm_k(int c) const { return pm.flow.factor_for_size_class(c); }
     // n tokens through windows of 16, the last one's logits_rows rows of logits
     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
         logits_all = false;
@@ -15524,10 +15517,7 @@ struct Model::Impl {
             ++pm.win_n;
         } else {
             const double ratio = std::min(8.0, std::max(0.25, ms / 1000.0 / pm.last_pred));
-            double& k = pm.k[0][pm.last_cls];
-            int64_t& n = pm.kn[0][pm.last_cls];
-            k = n == 0 ? ratio : 0.7 * k + 0.3 * ratio;
-            ++n;
+            pm.flow.observe_size_class(pm.last_cls, ratio);
         }
         pm.last = -1;
     }
