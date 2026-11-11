@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <cstring>
 
@@ -51,6 +52,30 @@ public:
         return sc::Storage::get_chunks(unit, keys, b, e);
     }
     void invalidate(const std::string& k) override { std::string e; local_->erase(k,e); ++invalidations; }
+};
+
+// Shared object ownership belongs to the producer. Consumers may retain local
+// bytes, but a removed manifest must still revoke their future recovery hits.
+class SharedObjects final : public sc::Storage {
+    std::map<std::string, Bytes> objects_;
+public:
+    bool shared() const override { return true; }
+    bool has_local_tier() const override { return false; }
+    uint64_t local_bytes(const std::string&, uint64_t) const override { return 0; }
+    bool put(const std::string& key, const Bytes& bytes, std::string&) override { objects_[key] = bytes; return true; }
+    bool get(const std::string& key, Bytes& bytes, std::string&) override {
+        const auto found = objects_.find(key);
+        if (found == objects_.end()) return false;
+        bytes = found->second; return true;
+    }
+    bool erase(const std::string&, std::string&) override { return true; }
+    std::vector<std::string> manifests(std::string&) override { return {}; }
+    std::vector<std::string> lookup(const sc::Prefix&, std::string&) override {
+        std::vector<std::string> keys;
+        for (const auto& [key, bytes] : objects_) { (void) bytes; if (key.starts_with("unit-")) keys.push_back(key); }
+        return keys;
+    }
+    void invalidate(const std::string& key) override { objects_.erase(key); }
 };
 
 int main() {
@@ -286,6 +311,20 @@ int main() {
             for (const auto& file : std::filesystem::directory_iterator(dir))
                 check(file.path().filename() == "owner.lock", "failed stream reclaims unpublished local chunks");
             std::filesystem::remove_all(dir);
+        }
+        {
+            auto c = config(); c.disk_bytes = 0;
+            auto storage = std::make_shared<SharedObjects>();
+            sc::StateCache producer(c, storage), consumer(c, storage);
+            const auto state = capture(prefix({1,2}), {1,2,3,4});
+            check(producer.publish(state, error), "shared producer capture"); producer.flush();
+            auto lease = consumer.find_resume(prefix({1,2,3}));
+            std::vector<sc::Region> out;
+            check(lease && consumer.restore(lease, out, error) && out[0].bytes == Bytes({1,2,3,4}), "consumer imports shared bytes");
+            consumer.release(lease); consumer.flush();
+            check(consumer.stats().ram_bytes == 4, "imported state promoted into consumer RAM");
+            producer.invalidate(state.prefix); producer.flush();
+            check(!consumer.find_resume(prefix({1,2,3})), "revoked shared manifest cannot resume from cached RAM");
         }
         std::cout << "state cache: all behavioral checks passed\n";
     } catch (const std::exception& e) {

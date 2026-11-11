@@ -1,11 +1,38 @@
 """Native conversation-state diagnostics, separate from decode-rate readings."""
+
 import math
 import time
 
-COUNTERS = {"hits", "misses", "restored_tokens", "admitted", "rejected", "evicted",
-            "promoted", "demoted", "read_failures", "write_failures", "calibration_samples", "ram_hits", "disk_hits", "remote_hits"}
-GAUGES = {"units", "ram_bytes", "disk_bytes", "logical_bytes", "watermark", "cost_d", "cost_e", "pending_writes",
-          "unique_bytes", "shared_bytes", "pinned_units", "pending_updates"}
+COUNTERS = {
+    "hits",
+    "misses",
+    "restored_tokens",
+    "admitted",
+    "rejected",
+    "evicted",
+    "promoted",
+    "demoted",
+    "read_failures",
+    "write_failures",
+    "calibration_samples",
+    "ram_hits",
+    "disk_hits",
+    "remote_hits",
+}
+GAUGES = {
+    "units",
+    "ram_bytes",
+    "disk_bytes",
+    "logical_bytes",
+    "watermark",
+    "cost_d",
+    "cost_e",
+    "pending_writes",
+    "unique_bytes",
+    "shared_bytes",
+    "pinned_units",
+    "pending_updates",
+}
 
 
 def parse(line):
@@ -29,8 +56,19 @@ def metrics(reading):
     rows = []
     for name in sorted(COUNTERS | GAUGES):
         value = reading.get(name)
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+        ):
             counter = name in COUNTERS
             key = f"maya:state_cache_{name}" + ("_total" if counter else "")
-            rows.append((key, "counter" if counter else "gauge", f"Conversation state cache {name}", value))
+            rows.append(
+                (
+                    key,
+                    "counter" if counter else "gauge",
+                    f"Conversation state cache {name}",
+                    value,
+                )
+            )
     return rows

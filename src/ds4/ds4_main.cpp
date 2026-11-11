@@ -853,7 +853,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::unique_ptr<sc::StateCache> state_cache;
     const auto state_config = sc::Config::environment((std::filesystem::path(pack) / "state-cache").string(), "DS4");
     if (env_num("MAYA_STATE_CACHE", 0) != 0) {
-        try { state_cache = std::make_unique<sc::StateCache>(state_config); }
+        try {
+            state_cache = std::make_unique<sc::StateCache>(state_config);
+            slot_max = 0;  // shared policy owns retention; the separate importer only reads legacy files
+        }
         catch (const std::exception& e) { std::fprintf(stderr, "ds4 state cache: unavailable (%s)\n", e.what()); }
     }
     const auto state_prefix = [&](const std::vector<int32_t>& tokens, const std::vector<Pic>& pictures) {
