@@ -10,6 +10,7 @@
 // same logits.  The thinking budget and the loop guard are generate.cpp's, rule for rule.
 #include "glm_metal.hpp"
 #include "sampler.hpp"
+#include "conversation_cache.hpp"
 #include "spec.hpp"
 #include "../../include/strata/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
 
@@ -107,6 +108,8 @@ struct Spec {
 
 struct Server {
     GlmMetal& model;
+    ConversationCache<GlmMetal> state_cache{model};
+    std::vector<strata::core::statecache::ExtraInput> state_images;
     Input in;
     std::vector<int32_t> cached;      // the previous prompt less its last token: what the snapshot holds
     uint64_t cached_img = 0;          // the images inside it (positions and rows, hashed)
@@ -261,6 +264,10 @@ struct Server {
                      " image rows";
             if (!ge.empty()) return err(ge);
         }
+        state_images.clear();
+        for (size_t i = 0; i < img_pos.size(); ++i)
+            state_images.push_back({uint64_t(img_pos[i]), 1, strata::core::statecache::content_digest(
+                img_rows.data() + i * size_t(model.geometry().n_embd), size_t(model.geometry().n_embd)*sizeof(float))});
         cur_pos = img_pos;
         cur_rows = img_rows;
         model.set_image_rows(std::move(img_pos), std::move(img_rows));
@@ -291,6 +298,7 @@ struct Server {
             reuse = (size_t) snap;
         else
             model.reset();
+        reuse = state_cache.restore(prompt, reuse, state_images);
         cached.clear();
 
         std::vector<float> logits;
@@ -310,12 +318,14 @@ struct Server {
                 model.reset();
                 return err(e);
             }
+            state_cache.publish(std::vector<int32_t>(prompt.begin(), prompt.begin() + (long)(at+k)), state_images);
             pp(at + k);
         }
         int64_t produced = 0;
         auto t1 = std::chrono::steady_clock::now();
         if (std::strcmp(finish, "cancel") != 0) {
             model.snapshot_save();
+            state_cache.publish(std::vector<int32_t>(prompt.begin(), prompt.end()-1), state_images);
             cached.assign(prompt.begin(), prompt.end() - 1);
             cached_img = img_prefix_hash((int64_t) cached.size());
             if (!model.forward({prompt.back()}, logits, e)) {
@@ -323,6 +333,8 @@ struct Server {
                 cached.clear();
                 return err(e);
             }
+            state_cache.observe(reuse, n, std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());
+            state_cache.publish(prompt, state_images);
             pp(n);
             t1 = std::chrono::steady_clock::now();
         } else {
@@ -487,6 +499,14 @@ struct Server {
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
+        auto processed = prompt;
+        processed.insert(processed.end(), emitted.begin(), emitted.end());
+        const size_t endpoint = size_t(model.position());
+        if (endpoint >= prompt.size() && endpoint <= processed.size()) {
+            processed.resize(endpoint);
+            state_cache.publish(processed, state_images, true);
+        }
+        state_cache.report();
         // PAUSE: every token written but the last was fed, so the state is the follow-up prompt's less its last
         // token - exactly what the prefix reuse restores
         if (in.pause.load() && std::strcmp(finish, "cancel") == 0 && !emitted.empty() &&
@@ -533,7 +553,7 @@ int mtp_draft_cap() {   // MAYA_GLM_MTP_DRAFT (default 3), at most 8 drafts a ro
 int serve(GlmMetal& model, const std::vector<std::string>& args) {
     (void) args;   // the server's CUDA-engine flags (--expert-cache, --prefill, --kv-streaming ...) mean nothing here
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    Server s{model, {}, {}};
+    Server s{model};
     // a prompt goes to forward() a slice at a time (STOP and the PP lines land between them): one --ubatch slice, or
     // 512-token pieces cut every --ubatch 2048 slice to 512 and its experts' tiles ran a quarter full
     s.chunk = model.ubatch();

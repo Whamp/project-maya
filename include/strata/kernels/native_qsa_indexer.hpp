@@ -39,4 +39,9 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
                                int64_t max_cells, float freq_base, void* stream);
 
+// Export the indexer tail at an interior batch endpoint, including the same
+// FP16 rounding as append. Call before the live tail is advanced.
+void native_qsa_indexer_export_tail(const float* raw, int64_t count, int64_t position,
+                                    const float* previous, float* checkpoint, void* stream);
+
 } // namespace strata::kernels

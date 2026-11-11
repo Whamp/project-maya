@@ -849,6 +849,58 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     const std::string slot_identity = m.slot_identity();
+    namespace sc = strata::core::statecache;
+    std::unique_ptr<sc::StateCache> state_cache;
+    const auto state_config = sc::Config::environment((std::filesystem::path(pack) / "state-cache").string(), "DS4");
+    if (env_num("MAYA_STATE_CACHE", 0) != 0) {
+        try { state_cache = std::make_unique<sc::StateCache>(state_config); }
+        catch (const std::exception& e) { std::fprintf(stderr, "ds4 state cache: unavailable (%s)\n", e.what()); }
+    }
+    const auto state_prefix = [&](const std::vector<int32_t>& tokens, const std::vector<Pic>& pictures) {
+        sc::Prefix prefix;
+        prefix.identity = m.state_identity();
+        prefix.tokens = tokens;
+        for (const auto& picture : pictures) {
+            if (picture.start < 0 || size_t(picture.start) >= tokens.size()) continue;
+            size_t length = picture.len;
+            if (!length) while (size_t(picture.start) + length < tokens.size() &&
+                               tokens[size_t(picture.start) + length] == img_tok) ++length;
+            prefix.extra.push_back({uint64_t(picture.start), uint64_t(length), std::to_string(picture.hash)});
+        }
+        return prefix;
+    };
+    const auto state_publish = [&](const std::vector<Pic>& pictures, bool ancestors, bool frontier = false) {
+        if (!state_cache || m.ablating() || m.pos() <= 0) return;
+        auto known_pictures = held;
+        for (const auto& picture : pictures) {
+            known_pictures.erase(std::remove_if(known_pictures.begin(), known_pictures.end(), [&](const Pic& old) {
+                return old.start == picture.start;
+            }), known_pictures.end());
+            known_pictures.push_back(picture);
+        }
+        std::sort(known_pictures.begin(), known_pictures.end(), [](const Pic& a, const Pic& b) { return a.start < b.start; });
+        auto positions = ancestors ? m.check_positions() : std::vector<int64_t>{};
+        positions.push_back(m.pos());
+        std::sort(positions.begin(), positions.end());
+        positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+        try {
+            for (auto n : positions) {
+                if (n <= 0 || size_t(n) > m.tokens().size()) continue;
+                std::vector<int32_t> tokens(m.tokens().begin(), m.tokens().begin() + n);
+                sc::Capture capture;
+                std::string error;
+                capture.prefix = state_prefix(tokens, known_pictures);
+                std::vector<sc::RegionSource> sources;
+                if (m.state_sources(capture.prefix, sources, error)) {
+                    capture.frontier = frontier && n == m.pos();
+                    state_cache->publish(std::move(capture), sources, error);
+                }
+                if (!error.empty()) std::fprintf(stderr, "ds4 state cache: capture skipped (%s)\n", error.c_str());
+            }
+        } catch (const std::bad_alloc&) { std::fprintf(stderr, "ds4 state cache: host budget exhausted\n"); }
+        std::printf("STATE %s\n", state_cache->report().c_str());
+    };
+
     constexpr uint64_t kMetaMagic = 0x334154454d345344ull;   // "DS4META3" (little endian)
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
@@ -1020,6 +1072,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
+        if (state_cache) { state_publish(held, true); return; }
         if (slot_max <= 0 || m.ablating()) return;   // (an abliterated conversation is not kept: read again)
         const std::vector<int32_t>& t = m.tokens();
         if (t.size() < slot_min) return;   // (a fresh engine's 0-token state is no conversation: nothing to set aside)
@@ -1169,7 +1222,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     std::vector<Prefix> prefixes;
     uint64_t prefix_clock = 0;
-    const int prefix_max = m.marks_cap() > 0 ? std::max(0, (int) env_num("MAYA_DS4_PREFIX_KEEP", 2)) : 0;
+    const int prefix_max = !state_cache && m.marks_cap() > 0 ? std::max(0, (int) env_num("MAYA_DS4_PREFIX_KEEP", 2)) : 0;
     const uint64_t prefix_budget = (uint64_t) (std::max(0.0, env_num("MAYA_DS4_PREFIX_GB", 2)) * 1073741824.0);
     const size_t prefix_min = (size_t) std::max(1.0, env_num("MAYA_DS4_PREFIX_MIN", 1024));
     // the longest kept start the prompt begins with, past `floor` tokens and short of its last token (none: -1)
@@ -1321,6 +1374,30 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGBREAK, SIG_IGN);
 #endif
+    }
+    if (state_cache && slot_keep && env_num("MAYA_STATE_MIGRATE", 1) != 0) {
+        const fs::path legacy_dir = std::getenv("MAYA_DS4_SLOT_DIR") ? fs::path(std::getenv("MAYA_DS4_SLOT_DIR")) : fs::path(pack) / "slots";
+        size_t imported = 0;
+        std::error_code ec;
+        for (const auto& file : fs::directory_iterator(legacy_dir, ec)) {
+            if (file.path().extension() != ".meta" || slot_age_days(file.path().string()) > slot_days) continue;
+            std::vector<int32_t> tokens; std::vector<int64_t> checkpoints; std::vector<Pic> pictures;
+            uint64_t bytes = 0;
+            const std::string path = file.path().string();
+            if (!meta_read(path, tokens, bytes, checkpoints, pictures) || !pictures.empty() ||
+                !bytes || bytes > state_config.ram_bytes) continue;
+            const std::string bin = path.substr(0, path.size()-5) + ".bin";
+            if (fs::file_size(bin, ec) != bytes || ec) { ec.clear(); continue; }
+            std::ifstream input(bin, std::ios::binary);
+            std::vector<uint8_t> payload(size_t(bytes), 0);
+            std::string error;
+            if (input.read(reinterpret_cast<char*>(payload.data()), std::streamsize(bytes)) &&
+                m.slot_load(payload.data(), payload.size(), int64_t(tokens.size()), error)) {
+                state_publish({}, true); ++imported;
+            }
+            m.reset();
+        }
+        if (imported) std::fprintf(stderr, "ds4 state cache: imported %zu compatible legacy text slots; source files retained\n", imported);
     }
     // STAT for the Monitor over a decode so far (from t1, the counters s_dec and the storage's io_dec then): the GLM
     // engine's keys (speed, the VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB
@@ -1501,7 +1578,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            if (slot_max > 0) slot_put("");
+            if (slot_max > 0 || state_cache) slot_put("");
             beat();
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
@@ -1521,6 +1598,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             } else if (rs >= 0 && m.restore(limit))
                 from = (size_t) m.pos();
             else m.reset();
+        }
+        if (state_cache && !abl) {
+            auto lease = state_cache->find_resume(state_prefix(r.ids, pics));
+            if (lease && lease.tokens() > from) {
+                std::string error;
+                if (m.state_load(*state_cache, lease, error)) {
+                    state_cache->restored(lease);
+                    from = size_t(lease.tokens());
+                    continued = false;
+                    held.clear();
+                    for (const auto& picture : pics) if (picture.start >= 0 && size_t(picture.start) < from) held.push_back(picture);
+                } else {
+                    from = 0; m.reset();
+                    std::fprintf(stderr, "ds4 state cache: restore missed (%s); recomputing\n", error.c_str());
+                }
+            }
+            state_cache->release(lease);
         }
         if (abl_flip && from == 0 && m.pos() != 0) m.reset();
         m.set_ablate(abl);
@@ -1735,6 +1829,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (ok && P.next_cut < P.cuts.size() && P.done == (size_t) P.cuts[P.next_cut].pos) {
                 const bool sh = P.cuts[P.next_cut].shared;
                 m.mark(sh);
+                state_publish(P.pics, false);
                 // (a shared start read from token 0 with no stop before it: the state a cold read keeps there - kept
                 //  apart for new conversations, #607)
                 bool pic = false;
@@ -1781,6 +1876,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         return true;
     };
     const auto prompt_end = [&](Prompt& P) {
+        if (state_cache) state_cache->observe_prefill(P.from, uint64_t(m.pos()), (now_ms() - P.t0) / 1000.);
         {   // one line a prompt: the tokens read, the time, and the free VRAM before and after (issues #648, #438)
             const std::string vt = strata::core::vram_mark_text(P.v0, strata::core::vram_mark(g_vram_gpus));
             if (!vt.empty())
@@ -1798,6 +1894,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held = std::move(nh);
         }
         m.checkpoint(0);
+        state_publish(held, true);
         if (!P.continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
     };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
@@ -1939,8 +2036,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         m.set_logprobs(-1);
         if (dump_f != nullptr) std::fflush(dump_f);
-        // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
-        //  the checkpoint at this prompt's end)
+        const int64_t committed = int64_t(r.ids.size()) + std::max<long long>(0, produced - 1);
+        if (!state_cache || m.state_commit(committed, err)) state_publish(held, true, true);
+        else std::fprintf(stderr, "ds4 state cache: stopped frontier skipped (%s)\n", err.c_str());
         stat_line();
         const double t2 = now_ms();
         if (turn_trace)
@@ -2100,6 +2198,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (lk_owner == a.r.rid) lk_owner = -1;
         };
         const auto finish_act = [&](Act& a) {
+            bind(a.seq);
+            const int64_t committed = int64_t(a.r.ids.size()) + std::max<long long>(0, a.produced - 1);
+            if (!state_cache || a.reading || m.state_commit(committed, err)) state_publish(held, true, true);
+            else std::fprintf(stderr, "ds4 state cache: stopped frontier skipped (%s)\n", err.c_str());
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
             end_note();

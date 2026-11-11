@@ -8,7 +8,9 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
 #include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -149,7 +151,9 @@ bool Mm3Metal::Impl::open_files(const std::string& path, std::string& err) {
             err = "cannot open " + p;
             return false;
         }
+#ifdef F_NOCACHE
         fcntl(fd, F_NOCACHE, 1);
+#endif
         ggufs.push_back(c);
         metas.push_back(meta);
         fds.push_back(fd);
@@ -280,9 +284,11 @@ bool Mm3Metal::Impl::init_backends(std::string& err) {
     int threads = o.cpu_threads;
     if (threads <= 0) {
         int perf = 0;
+#ifdef __APPLE__
         size_t sz = sizeof perf;
-        if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &sz, nullptr, 0) != 0 || perf <= 0)
-            perf = (int) std::max(1u, std::thread::hardware_concurrency());
+        sysctlbyname("hw.perflevel0.physicalcpu", &perf, &sz, nullptr, 0);
+#endif
+        if (perf <= 0) perf = (int) std::max(1u, std::thread::hardware_concurrency());
         threads = perf;
     }
     ggml_backend_cpu_set_n_threads(cpu, threads);

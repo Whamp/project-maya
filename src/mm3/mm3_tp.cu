@@ -1,5 +1,6 @@
 // src/mm3/mm3_tp.cu - maya-mm3's tensor-parallel path (see mm3_tp.hpp)
 #include "mm3_tp.hpp"
+#include "mm3_state_cache.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -208,6 +209,29 @@ struct TpEngine::Impl {
     Options o;
     Pack pk;
     Geo g;
+    int state_end = 0;
+    bool state_buffers(int n, bool loading, std::vector<StateDevice>& devices, std::string& error) {
+        if (n <= 0 || n > o.max_ctx || (!loading && n > state_end)) {
+            error = "MiniMax TP checkpoint endpoint has not been written"; return false;
+        }
+        devices.resize(M.size());
+        for (size_t i = 0; i < M.size(); ++i) devices[i].device = M[i].id;
+        for (size_t i = 0; i < L.size(); ++i) {
+            auto& layer = L[i];
+            const auto& group = G[size_t(layer.group)];
+            const int heads = g.n_kv / int(group.mem.size());
+            for (size_t member = 0; member < group.mem.size(); ++member) {
+                auto& slice = layer.sl[member];
+                auto& device = devices[size_t(group.mem[member])];
+                kv_state_regions("layer-" + std::to_string(i) + "/member-" + std::to_string(member), n, heads, g.ix_dim,
+                                 slice.kc, slice.vc, slice.ic, slice.kvq, slice.kvh, device.regions);
+                if (slice.kvh.ring) device.tags.push_back({slice.kvh.tag, size_t(slice.kvh.ring) * sizeof(int)});
+            }
+        }
+        if (draftm && !draftm->state_regions(n, devices[size_t(head_m)].regions, error, loading)) return false;
+        return true;
+    }
+
     Stats st;
     std::vector<std::string> info;
     std::vector<std::string> vram;           // the Monitor's VRAM lines (serve/gpu_map.py), measured at the load's end
@@ -2772,6 +2796,7 @@ struct TpEngine::Impl {
             last_done = n;
         }
         if (n == 1) st.t_token += now() - tc;
+        state_end = pos0 + last_done;
         return true;
     }
 
@@ -2817,6 +2842,38 @@ struct TpEngine::Impl {
 TpEngine::TpEngine() : p(new Impl) {}
 TpEngine::~TpEngine() = default;
 bool TpEngine::load(const Options& o, std::string& err) { return p->load(o, err); }
+std::string TpEngine::state_directory() const { return p->o.pack + "/state-cache"; }
+std::string TpEngine::state_identity() const {
+    std::string layout = "tensor-parallel";
+    for (const auto& group : p->G) layout += ":" + std::to_string(group.mem.size()) + "/" + std::to_string(group.l0) + "/" + std::to_string(group.l1);
+    return mm3::state_identity(p->pk, p->g, p->o, layout);
+}
+bool TpEngine::state_sources(const statecache::Prefix& prefix, std::vector<statecache::RegionSource>& out, std::string& error) {
+    std::vector<StateDevice> devices;
+    return p->state_buffers(int(prefix.tokens.size()), false, devices, error) &&
+           sources_state_buffers(state_identity(), devices, out, error);
+}
+bool TpEngine::state_load(statecache::StateCache& cache, const statecache::StateCache::Lease& lease, std::string& error) {
+    std::vector<StateDevice> devices;
+    const int n = int(lease.tokens());
+    const bool ok = p->state_buffers(n, true, devices, error) && load_state_buffers(state_identity(), devices, cache, lease, error);
+    p->state_end = ok ? n : 0;
+    if (p->draftm) p->draftm->state_loaded(ok ? n : 0);
+    return ok;
+}
+bool TpEngine::state_capture(statecache::Capture& out, const statecache::Prefix& prefix, std::string& error, size_t budget) {
+    std::vector<StateDevice> devices;
+    return p->state_buffers(int(prefix.tokens.size()), false, devices, error) &&
+           capture_state_buffers(state_identity(), prefix, devices, out, budget, error);
+}
+bool TpEngine::state_restore(const statecache::Prefix& prefix, const std::vector<statecache::Region>& regions, std::string& error) {
+    std::vector<StateDevice> devices;
+    const int n = int(prefix.tokens.size());
+    const bool ok = p->state_buffers(n, true, devices, error) && restore_state_buffers(state_identity(), devices, regions, error);
+    p->state_end = ok ? n : 0;
+    if (ok && p->draftm) p->draftm->state_loaded(n);
+    return ok;
+}
 bool TpEngine::forward(const int* ids, int n, int pos0, int want, float* logits, std::string& err) {
     return p->forward(ids, n, pos0, want, logits, err);
 }

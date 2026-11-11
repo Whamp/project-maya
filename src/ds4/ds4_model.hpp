@@ -13,6 +13,7 @@
 #pragma once
 
 #include "ds4_logprobs.hpp"
+#include "strata/core/state_cache.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -325,6 +326,8 @@ public:
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
+    /// Canonicalize a stopped speculative window to exactly the consumed transcript.
+    bool state_commit(int64_t endpoint, std::string& err);
     int64_t restorable(int64_t limit) const;
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
@@ -354,6 +357,14 @@ public:
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
+    std::string state_identity() const;
+    bool state_capture(core::statecache::Capture& out, const core::statecache::Prefix& prefix,
+                       std::string& err, size_t host_budget);
+    bool state_sources(const core::statecache::Prefix& prefix, std::vector<core::statecache::RegionSource>& out, std::string& err);
+    bool state_load(core::statecache::StateCache& cache, const core::statecache::StateCache::Lease& lease, std::string& err);
+    bool state_restore(const core::statecache::Prefix& prefix,
+                       const std::vector<core::statecache::Region>& regions, std::string& err);
+
 
     /// The vision tower: the token every position of an image's span carries (-1: no tower).
     int image_token() const;

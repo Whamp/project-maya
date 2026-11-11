@@ -69,6 +69,7 @@ struct DraftProf {
 struct Draft::Impl {
     DraftGeo g;
     int dev = 0, ring = 0, max_rows = 0;
+    int context_end = 0;
     cudaStream_t s = nullptr;
     cublasHandle_t blas = nullptr;
     const x3::Mat* head = nullptr;
@@ -373,6 +374,7 @@ struct Draft::Impl {
             k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
                             l.vc, s, ring);
         }
+        context_end = pos0 + n;
         return true;
     }
 
@@ -493,5 +495,27 @@ bool Draft::propose_sampled(int anchor, int pos, int n, const k::SampleArgs& sa,
     return p->propose(anchor, pos, n, drafts, conf, &sa, u.data(), &q, err);
 }
 size_t Draft::bytes() const { return p->bytes; }
+bool Draft::state_regions(int n, std::vector<strata::core::statecache::MemoryRegion>& out, std::string& error, bool loading) const {
+    namespace sc = strata::core::statecache;
+    if (n < 1 || (!loading && (n > p->context_end || n < p->context_end - 64))) {
+        error = "DSpark context window is not available at endpoint"; return false;
+    }
+    const size_t row = size_t(p->g.n_kv) * p->g.hd * sizeof(uint16_t);
+    const int start = std::max(0, n - p->g.window);
+    for (size_t layer = 0; layer < p->L.size(); ++layer) {
+        uint16_t* arrays[] = {p->L[layer].kc, p->L[layer].vc};
+        for (int role = 0; role < 2; ++role) {
+            sc::MemoryRegion region{"drafter/layer-" + std::to_string(layer) + (role ? "/value" : "/key"), {}};
+            for (int at = start; at < n;) {
+                const int offset = at % p->ring, count = std::min(n - at, p->ring - offset);
+                region.segments.push_back({reinterpret_cast<uint8_t*>(arrays[role]) + size_t(offset) * row, size_t(count) * row});
+                at += count;
+            }
+            out.push_back(std::move(region));
+        }
+    }
+    return true;
+}
+void Draft::state_loaded(int endpoint) { p->context_end = endpoint; }
 
 }  // namespace mm3

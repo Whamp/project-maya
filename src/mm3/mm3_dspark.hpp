@@ -24,6 +24,7 @@
 #include "mm3_exl3.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_pack.hpp"
+#include "strata/core/state_io.hpp"
 
 namespace mm3 {
 
@@ -70,6 +71,9 @@ public:
                          std::vector<std::vector<std::pair<int, float>>>& q, std::string& err);
     /// Device bytes the draft holds.
     size_t bytes() const;
+    bool state_regions(int endpoint, std::vector<strata::core::statecache::MemoryRegion>& out,
+                       std::string& error, bool loading = false) const;
+    void state_loaded(int endpoint);
 
 private:
     struct Impl;

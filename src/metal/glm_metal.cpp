@@ -47,7 +47,7 @@ struct Builder {
     ggml_cgraph* gf;
     int T;          // tokens in the slice
     int64_t p0;     // position of the slice's first token
-    bool window;    // a verify window: every row's state kept, every row's logits
+    bool window;    // a verify window: compact recurrence inputs and every row's logits
     const float* emb = nullptr;   // the slice's token embeddings [n_embd, T] (the MTP cache fill pairs them with rows)
     std::vector<Upload> uploads;
     std::vector<std::pair<std::string, ggml_tensor*>> dumps;
@@ -198,22 +198,29 @@ struct Builder {
         beta = ggml_sigmoid(ctx, ggml_reshape_4d(ctx, beta, 1, nh, T, 1));
         cb(beta, "kda_beta", il);
 
+        q = l2(q); k = l2(k);
         ggml_tensor* state = ggml_reshape_4d(ctx, s.ssm, hd, hd, nh, 1);
-        ggml_tensor* out = ggml_gated_delta_net(ctx, l2(q), l2(k), v, g1, beta, state, window ? T : 1);
+        if (window) {
+            // One initial recurrence plus projections replaces W full matrices.
+            auto* before = ggml_cpy(ctx, s.ssm, s.ssm_before);
+            expand(before);
+            for (auto pair : {std::make_pair(q, s.win_q), std::make_pair(k, s.win_k),
+                              std::make_pair(v, s.win_v), std::make_pair(g1, s.win_g),
+                              std::make_pair(beta, s.win_beta)}) {
+                auto* dst = ggml_view_4d(ctx, pair.second, pair.second->ne[0], nh, T, 1,
+                                        pair.second->nb[1], pair.second->nb[2], pair.second->nb[3], 0);
+                expand(ggml_cpy(ctx, pair.first, dst));
+            }
+            state = ggml_reshape_4d(ctx, before, hd, hd, nh, 1);
+        }
+        ggml_tensor* out = ggml_gated_delta_net(ctx, q, k, v, g1, beta, state, 1);
         const size_t es = ggml_element_size(out);
         ggml_tensor* o = ggml_view_4d(ctx, out, hd, nh, T, 1, (size_t) hd * es, (size_t) hd * nh * es,
                                       (size_t) hd * nh * T * es, 0);
         const int64_t S = (int64_t) hd * hd * nh;
         // the state copy follows the GDN directly: ggml-metal fuses the two (the kernel writes the state there and
         // skips its own output's state tail), so nothing may read that tail - a window's other copies read the copy
-        if (!window) {
-            expand(ggml_cpy(ctx, ggml_view_1d(ctx, out, S, (size_t) hd * nh * T * es), ggml_view_1d(ctx, s.ssm, S, 0)));
-        } else {   // the state after every row, newest first (slot 0 = after the last row)
-            ggml_tensor* slots = ggml_cpy(ctx, ggml_view_2d(ctx, out, S, T, (size_t) S * es, (size_t) hd * nh * T * es),
-                                          ggml_view_2d(ctx, s.ssm_win, S, T, s.ssm_win->nb[1], 0));
-            expand(slots);
-            expand(ggml_cpy(ctx, ggml_view_1d(ctx, slots, S, 0), ggml_view_1d(ctx, s.ssm, S, 0)));
-        }
+        expand(ggml_cpy(ctx, ggml_view_1d(ctx, out, S, (size_t) hd * nh * T * es), ggml_view_1d(ctx, s.ssm, S, 0)));
         o = ggml_cont(ctx, o);
         cb(o, "kda_scan_out", il);
 
@@ -694,6 +701,7 @@ void GlmMetal::set_options(const GlmOptions& o) { p_->o = o; }
 
 bool GlmMetal::load(const std::string& path, int64_t max_ctx, std::string& err) {
     Impl& m = *p_;
+    m.model_path = path;
     if (max_ctx < 1 || m.o.n_ubatch < 1 || m.o.attn_chunk < 1) {
         err = "the context, the slice and the attention chunk need at least one token";
         return false;
@@ -767,21 +775,29 @@ bool GlmMetal::accept(int n, std::string& err) {
     m.dflash_forget(m.pos);
     m.hx_col = n - 1;
     if (n == T) return true;   // the state is already the last row's
-    // the recurrent state after row n - 1: conv history columns n .. n + dc - 1, the GDN snapshot T - n back
-    const size_t mem = ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(512, false);
+    // Replay only accepted projections; no future column reaches committed state.
+    const int nodes = std::max(512, int(m.ls.size()) * 32);
+    const size_t mem = ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false);
     if (m.arena.size() < mem) m.arena.resize(mem);
     ggml_init_params ip{mem, m.arena.data(), true};
     ggml_context* ctx = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx, 512, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx, nodes, false);
     const int64_t dc = m.g.d_conv - 1;
     for (const LayerState& s : m.ls) {
         if (!s.conv) continue;
         ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_3d(ctx, s.conv_win, dc, s.conv->ne[1], 3, s.conv_win->nb[1],
                                                                 s.conv_win->nb[2], (size_t) n * s.conv_win->nb[0]),
                                                s.conv));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx, ggml_view_1d(ctx, s.ssm_win, s.ssm_win->ne[0],
-                                                                (size_t) (T - n) * s.ssm_win->nb[1]),
-                                               ggml_view_1d(ctx, s.ssm, ggml_nelements(s.ssm), 0)));
+        const auto inputs = [&](ggml_tensor* t) {
+            return ggml_view_4d(ctx, t, t->ne[0], t->ne[1], n, 1, t->nb[1], t->nb[2], t->nb[3], 0);
+        };
+        auto* out = ggml_gated_delta_net(ctx, inputs(s.win_q), inputs(s.win_k), inputs(s.win_v),
+                                        inputs(s.win_g), inputs(s.win_beta),
+                                        ggml_reshape_4d(ctx, s.ssm_before, m.g.kda_head_dim,
+                                                        m.g.kda_head_dim, m.g.n_head, 1), 1);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx,
+            ggml_view_1d(ctx, out, ggml_nelements(s.ssm), size_t(m.g.kda_head_dim) * m.g.n_head * n * sizeof(float)),
+            ggml_view_1d(ctx, s.ssm, ggml_nelements(s.ssm), 0)));
     }
     ggml_backend_sched_reset(m.sched);
     const bool ok = ggml_backend_sched_alloc_graph(m.sched, gf) &&

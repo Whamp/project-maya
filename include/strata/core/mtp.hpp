@@ -93,6 +93,7 @@ public:
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw() { return st_; }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    int64_t minimum_reusable_prompt() const { return first_needed() > 0 ? prompt_len_ : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }

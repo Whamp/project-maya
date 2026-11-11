@@ -17,6 +17,7 @@
 // effect).
 #include "mm3_metal.hpp"
 #include "sampler.hpp"
+#include "conversation_cache.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -97,6 +98,8 @@ struct Input {
 
 struct Server {
     Mm3Metal& model;
+    ConversationCache<Mm3Metal> state_cache{model};
+    std::vector<strata::core::statecache::ExtraInput> state_images;
     Input in;
     std::vector<int32_t> cached;      // the previous prompt less its last token: what the snapshot holds
     const int loop_w_think = env_int("MAYA_MM3_LOOP_THINK", 256);
@@ -225,6 +228,7 @@ struct Server {
             reuse = (size_t) snap;
         else
             model.reset();
+        reuse = state_cache.restore(prompt, reuse, state_images);
         cached.clear();
 
         std::vector<float> logits;
@@ -244,18 +248,22 @@ struct Server {
                 model.reset();
                 return err(e);
             }
+            state_cache.publish(std::vector<int32_t>(prompt.begin(), prompt.begin() + (long)(at+k)), state_images);
             pp(at + k);
         }
         int64_t produced = 0;
         auto t1 = std::chrono::steady_clock::now();
         if (std::strcmp(finish, "cancel") != 0) {
             model.snapshot_save();
+            state_cache.publish(std::vector<int32_t>(prompt.begin(), prompt.end()-1), state_images);
             cached.assign(prompt.begin(), prompt.end() - 1);
             if (!model.forward({prompt.back()}, logits, e)) {
                 model.reset();
                 cached.clear();
                 return err(e);
             }
+            state_cache.observe(reuse, n, std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count());
+            state_cache.publish(prompt, state_images);
             pp(n);
             t1 = std::chrono::steady_clock::now();
         } else {
@@ -392,6 +400,14 @@ struct Server {
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
+        auto processed = prompt;
+        processed.insert(processed.end(), emitted.begin(), emitted.end());
+        const size_t endpoint = size_t(model.position());
+        if (endpoint >= prompt.size() && endpoint <= processed.size()) {
+            processed.resize(endpoint);
+            state_cache.publish(processed, state_images, true);
+        }
+        state_cache.report();
         // PAUSE: every token written but the last was fed, so the state is the follow-up prompt's less its last
         // token - exactly what the prefix reuse restores
         if (in.pause.load() && std::strcmp(finish, "cancel") == 0 && !emitted.empty() &&
@@ -417,7 +433,7 @@ struct Server {
 int serve(Mm3Metal& model, const std::vector<std::string>& args) {
     (void) args;   // the server's CUDA-engine flags mean nothing here
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    Server s{model, {}, {}};
+    Server s{model};
     s.chunk = model.ubatch();
     if (const char* c = std::getenv("MAYA_METAL_PP_CHUNK")) s.chunk = std::max(1, std::atoi(c));
     const auto& st = model.stats();
