@@ -127,6 +127,12 @@ public:
     virtual void dead(const std::string&) {}
     virtual void invalidate(const std::string& key) { dead(key); }
     virtual bool shared() const { return false; }
+    // Imported units retain the shared manifest as their recovery authority,
+    // even after every payload chunk has been promoted into local RAM.
+    virtual bool validate_unit(const std::string& key, std::string& error) {
+        Bytes manifest;
+        return get(key, manifest, error);
+    }
     virtual uint64_t local_bytes(const std::string&, uint64_t expected) const { return expected; }
     virtual double age_seconds(const std::string&) const { return 0; }
     virtual bool has_local_tier() const { return true; }

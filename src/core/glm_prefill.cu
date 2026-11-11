@@ -610,7 +610,7 @@ struct Glm5Model::PrefillState {
     size_t checkpoint_run = 0, checkpoint_rec = 0, checkpoint_pool = 0;
     std::vector<int> checkpoint_layers;
     std::vector<uint8_t> checkpoint_written, checkpoint_pool_written;
-    void export_pool(int il, gb::DsaPrepArgs& args) {
+    void export_pool(int il, gb::DsaPrepArgs& args, bool nextn = false) {
         if (checkpoint_at < 0 || checkpoint_pool == 0) return;
         const auto found = std::find(checkpoint_layers.begin(), checkpoint_layers.end(), il);
         if (found == checkpoint_layers.end()) return;
@@ -619,9 +619,10 @@ struct Glm5Model::PrefillState {
         args.checkpoint_ik = checkpoint_gpu + checkpoint_run + index * 2 * rows;
         args.checkpoint_ig = args.checkpoint_ik + rows;
         args.checkpoint_rows = (int) (rows / (size_t) args.idx_key);
-        args.checkpoint_start = (int) checkpoint_at - (int) checkpoint_at % (args.checkpoint_rows + 1);
-        args.checkpoint_end = (int) checkpoint_at;
-        if (args.p0 < checkpoint_at && (int64_t) args.p0 + args.T >= checkpoint_at)
+        const int64_t end = checkpoint_at - (nextn ? 1 : 0);
+        args.checkpoint_start = (int) end - (int) end % (args.checkpoint_rows + 1);
+        args.checkpoint_end = (int) end;
+        if (args.p0 <= end && (int64_t) args.p0 + args.T >= end)
             checkpoint_pool_written[index] = 1;
     }
     int T = 0;                       // tokens per chunk
@@ -4455,7 +4456,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.ig_raw = ig + (size_t) t0 * g.idx_key;
                 d.p0 = (int) p0 + t0;
                 d.T = tn;
-                S->export_pool(mtp_il_, d);
+                S->export_pool(mtp_il_, d, true);
                 gb::dsa_prep(d, s);
                 const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
                 if (pool_hi >= pool_lo)

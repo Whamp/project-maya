@@ -75,6 +75,56 @@ int main(int argc, char** argv) {
         need(model.state_restore(prefix, capture.regions, error) && model.position() == 39, error);
         need(model.forward({40}, logits, error), error);
         for (float value : logits) need(std::isfinite(value), "restored interior state produced non-finite logits");
+        if (model.has_mtp()) {
+            // At an aligned trunk endpoint, NextN still needs the preceding
+            // pool's rows: its context ends at n-1, not n.
+            constexpr int64_t mark = 40;
+            // Equal microbatch shapes keep the oracle independent of CUDA's
+            // numerical differences between eight-row and sixteen-row products.
+            model.prefill_force_chunk = 8;
+            model.reset();
+            need(model.prefill(first, error, 33), error);
+            need(model.prefill_export_prepare(0, mark, error), error);
+            need(model.prefill(second, error, 65), error);
+            need(model.ckpt_save_at(0, mark, error), error);
+            prefix.tokens.resize(size_t(mark));
+            for (int32_t i = 0; i < mark; ++i) prefix.tokens[size_t(i)] = i+1;
+            sc::Capture exported, exact, restored;
+            need(model.state_capture(exported, prefix, 0, error), error);
+            model.reset();
+            need(model.prefill(first, error, 33), error);
+            const std::vector<int32_t> tail(second.begin(), second.begin()+8);
+            need(model.prefill(tail, error, 41), error);
+            need(model.snapshot_save(), "exact aligned endpoint snapshot");
+            need(model.state_capture(exact, prefix, -1, error), error);
+            need(model.state_restore(prefix, exported.regions, error), error);
+            need(model.snapshot_save(), "restored aligned endpoint snapshot");
+            need(model.state_capture(restored, prefix, -1, error), error);
+            const auto pool = [](const sc::Capture& state) -> const sc::Bytes& {
+                for (const auto& region : state.regions) if (region.name == "part-0/open-pool") return region.bytes;
+                throw std::runtime_error("NextN open pool absent");
+            };
+            const auto& expected_pool = pool(exact);
+            const auto& restored_pool = pool(restored);
+            const size_t count = size_t(model.geometry().idx_kpool-1)*model.geometry().idx_key*2;
+            need(expected_pool.size() >= count*4 && restored_pool.size() >= count*4, "NextN pool shape");
+            size_t written = 0, actual_written = 0;
+            float max_difference = 0;
+            for (size_t i = 0; i < count; ++i) {
+                float expected_value, actual_value;
+                std::memcpy(&expected_value, expected_pool.data()+i*4, 4);
+                std::memcpy(&actual_value, restored_pool.data()+i*4, 4);
+                written += expected_value != 0;
+                need(std::isfinite(actual_value), "aligned interior NextN pool is non-finite");
+                actual_written += actual_value != 0;
+                max_difference = std::max(max_difference, std::abs(actual_value-expected_value));
+            }
+            std::printf("NextN pool: expected nonzero %zu, restored nonzero %zu, max difference %.9g\n", written, actual_written, max_difference);
+            need(written > 0, "NextN oracle did not produce any pool rows");
+            need(max_difference < 1e-5f, "aligned interior export changed NextN open-pool state");
+            model.prefill_force_chunk = 0;
+            std::puts("GLM NextN: aligned interior checkpoint matches exact-endpoint restore");
+        }
         std::puts("GLM state cache: intervening request, SSD restart, identical-prompt logits and interior restore passed");
     } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

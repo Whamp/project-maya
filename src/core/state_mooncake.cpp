@@ -81,7 +81,18 @@ class Mooncake final : public Storage {
 public:
     explicit Mooncake(std::shared_ptr<Storage> local) : local_(std::move(local)) {
         int sockets[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) throw std::runtime_error("Mooncake socketpair failed");
+        int socket_type = SOCK_STREAM;
+#ifdef SOCK_CLOEXEC
+        socket_type |= SOCK_CLOEXEC;
+#endif
+        if (socketpair(AF_UNIX, socket_type, 0, sockets)) throw std::runtime_error("Mooncake socketpair failed");
+#ifndef SOCK_CLOEXEC
+        // Darwin exposes close-on-exec through fcntl rather than socket type flags.
+        if (fcntl(sockets[0], F_SETFD, FD_CLOEXEC) < 0 || fcntl(sockets[1], F_SETFD, FD_CLOEXEC) < 0) {
+            close(sockets[0]); close(sockets[1]);
+            throw std::runtime_error("Mooncake close-on-exec setup failed");
+        }
+#endif
         const char* python = std::getenv("MAYA_STATE_MOONCAKE_PYTHON");
         const char* helper = std::getenv("MAYA_STATE_MOONCAKE_HELPER");
         if (!python) python = "python3";
@@ -109,6 +120,11 @@ public:
     }
     ~Mooncake() override { stop(); }
     bool shared() const override { return true; }
+    bool validate_unit(const std::string& key, std::string& error) override {
+        // Imported RAM/SSD copies do not override the producer's revocation.
+        try { request('V', key, {}); return true; }
+        catch (const std::exception& e) { error = e.what(); return false; }
+    }
     bool has_local_tier() const override { return bool(local_); }
     uint64_t local_bytes(const std::string& key, uint64_t expected) const override {
         return local_ ? local_->local_bytes(key, expected) : 0;

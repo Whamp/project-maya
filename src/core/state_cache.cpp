@@ -279,6 +279,7 @@ struct StateCache::Unit {
     uint64_t uses = 0;
     uint64_t min_prompt_tokens = 0;
     bool sampling_ready = false, anchor = false, frontier = false, ram = true, stored = false, pending = false, dead = false;
+    bool imported = false;
 };
 
 struct StateCache::Impl {
@@ -495,7 +496,8 @@ struct StateCache::Impl {
                 }
                 const auto expected = hash(std::span<const uint8_t>(b).first(r.at));
                 if (r.n() != expected || r.at != b.size()) continue;
-                u->ram = false; u->stored = true; u->used_at = clock(); units[key] = std::move(u);
+                u->ram = false; u->stored = true; u->imported = candidates != nullptr;
+                u->used_at = clock(); units[key] = std::move(u);
             } catch (const std::exception&) { ++stats.read_failures; }
         }
         account();
@@ -521,7 +523,7 @@ struct StateCache::Impl {
                   if (!ok) {
                       ++stats.write_failures;
                       const auto found = units.find(job.key);
-                      if (job.operation == 'T' && found != units.end() && !found->second->dead) {
+                      if (job.operation == 'T' && found != units.end() && !found->second->dead && !found->second->imported) {
                           found->second->stored = false;
                           if (!found->second->pending && config.write_through) {
                               found->second->pending = true; writes.emplace_back(found->second);
@@ -902,6 +904,12 @@ StateCache::Lease StateCache::find_resume(const Prefix& prompt, bool need_sample
         (void) key;
         if (u->dead || u->prefix.tokens.size() < found.tokens() || prompt.tokens.size() < u->min_prompt_tokens || !extends(prompt, u->prefix) ||
             (need_sample && u->prefix.tokens.size() == prompt.tokens.size() && !u->sampling_ready)) continue;
+        if (u->imported) {
+            std::string error;
+            if (!p_->storage->validate_unit(key, error)) {
+                u->dead = true; ++p_->stats.read_failures; continue;
+            }
+        }
         found.unit_ = u;
     }
     if (found) { found.unit_->stamp = p_->stats.watermark; found.unit_->used_at = p_->clock(); ++found.unit_->uses;
