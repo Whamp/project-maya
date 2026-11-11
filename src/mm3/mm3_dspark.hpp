@@ -25,6 +25,7 @@
 #include "mm3_exl3.hpp"
 #include "mm3_kernels.cuh"
 #include "mm3_pack.hpp"
+#include "strata/core/state_io.hpp"
 
 namespace mm3 {
 
@@ -74,6 +75,9 @@ public:
     /// The device bytes load() will hold for this pack and max_rows (its allocations, from the pack's geometry - the
     /// placement's room for the draft before it loads; 0: the pack has no draft).
     static size_t plan_bytes(const Pack& pk, int max_rows);
+    bool state_regions(int endpoint, std::vector<strata::core::statecache::MemoryRegion>& out,
+                       std::string& error, bool loading = false) const;
+    void state_loaded(int endpoint);
 
 private:
     struct Impl;

@@ -25,6 +25,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "qwen_state_cache.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -1432,6 +1433,65 @@ static int glm_pack_generate(const Options& o) {
         for (const auto& s : shards) id << " " << s;
         return id.str();
     }();
+    std::unique_ptr<strata::core::statecache::StateCache> state_cache;
+    if (o.serve && model.fast() && env_num("MAYA_STATE_CACHE", 0) != 0 && !getenv("MAYA_GLM_NO_REUSE")) {
+        try {
+            auto config = strata::core::statecache::Config::environment((fs::path(o.glm_pack) / "state-cache").string(), "GLM");
+            state_cache = std::make_unique<strata::core::statecache::StateCache>(std::move(config));
+            slot_max = 0;
+            std::fprintf(stderr, "glm state cache: exact checkpoints, dependency-aware GDS, RAM and asynchronous storage\n");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "glm state cache: unavailable (%s); legacy slots retained\n", e.what());
+        }
+    }
+    const std::string state_artifacts = [&] {
+        std::ostringstream id; std::error_code ec;
+        for (const char* file : {"index.txt", "dense.bin", "native_experts.txt"}) {
+            const auto path = fs::path(o.glm_pack)/file;
+            id << " " << file << ":" << fs::last_write_time(path, ec).time_since_epoch().count();
+        }
+        for (const auto& entry : fs::directory_iterator(fs::path(o.glm_pack).parent_path(), ec))
+            if (entry.path().extension() == ".gguf")
+                id << " " << entry.path().filename().string() << ":" << entry.last_write_time(ec).time_since_epoch().count();
+        for (const char* key : {"MAYA_GLM_DFLASH", "MAYA_GLM_MTP_GGUF"}) if (const char* path = std::getenv(key))
+            id << " " << key << "=" << path << ":" << fs::file_size(path, ec) << ":" << fs::last_write_time(path, ec).time_since_epoch().count();
+        for (const char* key : {"MAYA_GLM_KDA_MODE", "MAYA_GLM_LAT_Q8", "MAYA_GLM_KV", "MAYA_GLM_DFLASH_CTX", "MAYA_GLM_MTP_DEC"})
+            if (const char* value = std::getenv(key)) id << " " << key << "=" << value;
+        return id.str();
+    }();
+    const auto state_prefix = [&](const std::vector<int32_t>& tokens) {
+        strata::core::statecache::Prefix prefix;
+        prefix.identity = slot_identity + " pack=" + fs::absolute(o.glm_pack).string() + state_artifacts;
+        prefix.tokens = tokens;
+        const size_t E = (size_t) model.geometry().n_embd;
+        for (size_t i = 0; i < cur_img_pos.size() && cur_img_pos[i] < (int64_t) tokens.size(); ++i)
+            prefix.extra.push_back({(uint64_t) cur_img_pos[i], 1,
+                strata::core::statecache::content_digest(cur_img_rows.data() + i * E, E * sizeof(float))});
+        return prefix;
+    };
+    const auto state_publish = [&](const std::vector<int32_t>& tokens, int checkpoint = -1, bool anchor = false,
+                                   const std::vector<strata::core::statecache::ExtraInput>* extra = nullptr, bool frontier = false) {
+        if (!state_cache || tokens.empty() || model.ablating()) return;
+        try {
+            strata::core::statecache::Capture capture;
+            std::string error;
+            auto prefix = state_prefix(extra ? std::vector<int32_t>{} : tokens);
+            prefix.tokens = tokens;
+            if (extra) {
+                prefix.extra.clear();
+                for (const auto& input : *extra) if (input.position < tokens.size()) prefix.extra.push_back(input);
+            }
+            std::vector<strata::core::statecache::RegionSource> sources;
+            if (model.state_sources(prefix, checkpoint, sources, error)) {
+                capture.prefix = std::move(prefix); capture.anchor = anchor; capture.frontier = frontier;
+                state_cache->publish(std::move(capture), sources, error);
+            }
+            if (!error.empty()) std::fprintf(stderr, "glm state cache: capture skipped (%s)\n", error.c_str());
+            std::printf("STATE %s\n", state_cache->report().c_str());
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "glm state cache: capture does not fit in host memory\n");
+        }
+    };
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
@@ -1693,6 +1753,27 @@ static int glm_pack_generate(const Options& o) {
         return len;
       }
     };
+    // Import compatible kept text slots through the native loader. The source
+    // files remain untouched; the shared manager alone decides what to retain.
+    if (state_cache && slot_keep && !slot_ram && env_num("MAYA_STATE_MIGRATE", 1) != 0) {
+        const fs::path legacy_dir = getenv("MAYA_GLM_SLOT_DIR") ? fs::path(getenv("MAYA_GLM_SLOT_DIR")) : fs::path(o.glm_pack) / "slots";
+        const auto budget = strata::core::statecache::Config::environment({}, "GLM").ram_bytes;
+        size_t imported = 0;
+        std::error_code ec;
+        for (const auto& file : fs::directory_iterator(legacy_dir, ec)) {
+            if (file.path().extension() != ".meta" || slot_age_days(file.path().string()) > slot_days) continue;
+            std::vector<int32_t> tokens; uint64_t bytes = 0, images = 0;
+            const std::string path = file.path().string();
+            if (!meta_read(path, tokens, bytes, images) || images != kNoImages || !bytes || bytes > budget) continue;
+            const std::string bin = path.substr(0, path.size()-5) + ".bin";
+            if (fs::file_size(bin, ec) != bytes || ec) { ec.clear(); continue; }
+            std::string error;
+            if (model.slot_load(bin, int64_t(tokens.size()), error)) { state_publish(tokens); ++imported; }
+            model.reset();
+        }
+        snap_tokens.clear(); snap_in_slot = false; snap_img_hash = kNoImages;
+        if (imported) std::fprintf(stderr, "glm state cache: imported %zu compatible legacy text slots; source files retained\n", imported);
+    }
     // a request's DFlash window and draft cut (its GEN line's spec= / spec_min_p=; 0 / -1: as the engine started)
     int req_spec = 0;
     double req_spec_min_p = -1.0;
@@ -1725,10 +1806,11 @@ static int glm_pack_generate(const Options& o) {
     std::vector<Ckpt> ckpts;   // the bound context's (several conversations: each context's in turn, see bind_ctx)
     uint64_t ckpt_clock = 0;
     int ckpt_base = 0;         // the bound context's first checkpoint slot in the model (0 with one conversation)
-    const bool multi_ckpts = model.seq_count() > 1 && env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0;
+    const bool multi_ckpts = model.seq_count() > 1 && (state_cache || env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0);
     const int ckpt_max = [&] {
         if (!model.fast() || getenv("MAYA_GLM_NO_REUSE") != nullptr) return 0;
         const int want = std::max(0, std::min(16, (int) env_num("MAYA_GLM_CKPTS", 4)));
+        if (state_cache) return want > 0 ? 1 : 0;
         if (model.seq_count() <= 1) return want;
         if (!multi_ckpts) return 0;
         constexpr int kMultiCkptSlots = 32;   // every context's together (~4.8 GB with GLM-5.3-Flash at most)
@@ -1755,7 +1837,7 @@ static int glm_pack_generate(const Options& o) {
     const auto ckpt_marks = [&](const std::vector<int32_t>& prompt, size_t from, size_t end) {
         constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
         std::vector<size_t> at;
-        if (ckpt_max <= 0 || !cur_img_pos.empty() || end <= from + 512) return at;
+        if (ckpt_max <= 0 || (!state_cache && !cur_img_pos.empty()) || end <= from + 512) return at;
         size_t first = 0, last = 0;
         for (size_t i = 1; i < end; ++i)
             if (prompt[i] == kUserTok || prompt[i] == kObsTok) {
@@ -1776,7 +1858,7 @@ static int glm_pack_generate(const Options& o) {
         std::sort(at.begin(), at.end());
         at.erase(std::unique(at.begin(), at.end()), at.end());
         // at most ckpt_max a prompt, the latest kept (the turn's start, then the ones before it)
-        if ((int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
+        if (!state_cache && (int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
         // every prompt-path call between them must reach its minimum (MAYA_GLM_PREFILL_MIN, 32: fewer go through the
         // token path, one token at a time): only the piece after the last one may be shorter
         std::vector<size_t> kept;
@@ -1824,6 +1906,7 @@ static int glm_pack_generate(const Options& o) {
         }
         ckpts[c].tokens.assign(prompt.begin(), prompt.begin() + (long) p);
         ckpts[c].used = ++ckpt_clock;
+        state_publish(ckpts[c].tokens, slot);
     };
     // A route that found a non-finite score (or an expert id out of range) means a NaN or an infinity in the state the
     // request ran on: its conversation must not be served again.  The kept snapshot and every slot this prompt
@@ -1831,6 +1914,7 @@ static int glm_pack_generate(const Options& o) {
     // retry reads the prompt from token 0.  The ERR line names it "non-finite" (Glm5Model::route_ok's words).
     const auto drop_if_poisoned = [&](const std::vector<int32_t>& prompt, const std::string& why) {
         if (why.find("non-finite") == std::string::npos) return;
+        if (state_cache) state_cache->invalidate(state_prefix(prompt));
         snap_tokens.clear();
         snap_in_slot = false;
         ckpt_drop_past(0);
@@ -1860,6 +1944,8 @@ static int glm_pack_generate(const Options& o) {
         int ctx = 0;
         std::vector<int32_t> prompt, emitted;
         bool keep = false;
+        std::vector<strata::core::statecache::ExtraInput> extra;
+        uint64_t image_hash = kNoImages;
     };
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
@@ -1886,7 +1972,7 @@ static int glm_pack_generate(const Options& o) {
                              img_hash(snap_tokens.size()) == snap_img_hash && getenv("MAYA_GLM_NO_REUSE") == nullptr;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
         int ck = -1;
-        if (ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
+        if (!state_cache && ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
             for (int c = 0; c < (int) ckpts.size(); ++c) {
                 const auto& t = ckpts[(size_t) c].tokens;
                 if (!t.empty() && t.size() < prompt.size() && (ck < 0 || t.size() > ckpts[(size_t) ck].tokens.size()) &&
@@ -1924,7 +2010,7 @@ static int glm_pack_generate(const Options& o) {
         }
         // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
         // (no-op unless MAYA_GLM_PROMPT_CACHE_DIR on a glm-dsa model; the slots are off then)
-        if (reuse == 0 && !model.ablating()) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
+        if (reuse == 0 && !state_cache && !model.ablating()) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
@@ -1939,7 +2025,28 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
-        if (reuse == 0 && !abl_want) reuse = strata::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
+        if (state_cache && !abl_want) {
+            auto lease = state_cache->find_resume(state_prefix(prompt));
+            if (lease && lease.tokens() > reuse) {
+                std::string error;
+                if (model.state_load(*state_cache, lease, error)) {
+                    state_cache->restored(lease);
+                    reuse = lease.tokens();
+                    snap_tokens = lease.prefix().tokens;
+                    snap_img_hash = img_hash(reuse);
+                    snap_in_slot = false;
+                    ckpt_drop_past(0);
+                    from_ckpt = false;
+                    std::fprintf(stderr, "glm state cache: restored %zu of %zu prompt tokens\n", reuse, prompt.size());
+                } else {
+                    reuse = 0;
+                    snap_tokens.clear();
+                    std::fprintf(stderr, "glm state cache: restore failed (%s); recomputing\n", error.c_str());
+                }
+            }
+            state_cache->release(lease);
+        }
+        if (reuse == 0 && !state_cache && !abl_want) reuse = strata::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
         if (reuse == 0) model.reset();
         if (model.ablate_loaded()) {   // (the conversation's setting from here on: the state it holds now is read so)
             model.set_ablate(abl_want);
@@ -2056,14 +2163,24 @@ static int glm_pack_generate(const Options& o) {
             }
             int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
             while (pok && at < snap_at) {
-                const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
+                size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
+                const size_t first_mark = seg_end;
+                const bool export_candidate = state_cache && !model.ckpt_positional() && mi < marks.size() &&
+                                              env_num("MAYA_STATE_PREFILL_EXPORT", 1) != 0;
+                if (export_candidate) seg_end = mi + 1 < marks.size() ? marks[mi + 1] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
                     // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
                     if (at == seg_start || seg_chunk == 0) seg_chunk = model.prefill_chunk_for((int64_t) (seg_end - seg_start));
                     piece = strata::core::prefill_aligned_piece(piece, (size_t) seg_chunk);
                 }
-                const size_t end = strata::core::prefill_piece_end(at, seg_end, piece);
+                size_t end = strata::core::prefill_piece_end(at, seg_end, piece);
+                bool exporting = false;
+                if (export_candidate && first_mark < end) {
+                    std::string export_error;
+                    exporting = model.prefill_export_prepare(ckpt_base, (int64_t) first_mark, export_error);
+                    if (!exporting) { seg_end = first_mark; end = std::min(end, first_mark); }
+                }
                 // (an interleaved piece cut freely (,cut): both GPUs of a split at work - two chunks, or ~4096-token ones
                 // for a larger piece: a call fills and drains the split's pipeline, a GPU idle for a chunk each way)
                 model.prefill_min_chunks = piece > 0 && !interleave.exact ? std::max<int>(2, (int) (piece / 4096)) : 1;
@@ -2085,6 +2202,12 @@ static int glm_pack_generate(const Options& o) {
                     at = end;
                     read_to.store(at, std::memory_order_relaxed);
                     keep_later(at);
+                    if (exporting) {
+                        ckpt_keep(prompt, first_mark, false, true);
+                        ++mi;
+                        seg_start = first_mark;
+                        seg_chunk = 0;
+                    }
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
@@ -2192,6 +2315,7 @@ static int glm_pack_generate(const Options& o) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
+                    state_publish(snap_tokens);
                 } else {
                     snap_tokens.clear();
                 }
@@ -2222,14 +2346,20 @@ static int glm_pack_generate(const Options& o) {
                              prompt.size() > reuse ? prompt.size() - reuse : (size_t) 0,
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), vt.c_str());
         }
+        if (state_cache && model.position() > int64_t(reuse))
+            state_cache->observe_prefill(reuse, uint64_t(model.position()),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
         return 0;
     };
     // PAUSE: the snapshot moves from the prompt to the last token fed (the decode feeds every written token but
     // the last), so prompt + what was written continues it with one token to read instead of all it wrote.
-    // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
+    // Capture only the actual processed endpoint. Each parallel request carries
+    // its own image identity through deferred completion.
     const auto pause_snapshot = [&](const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted,
-                                    bool keep) {
-        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("MAYA_GLM_NO_REUSE") == nullptr) {
+                                    bool keep,
+                                    const std::vector<strata::core::statecache::ExtraInput>* extra = nullptr,
+                                    uint64_t image_hash = 0) {
+        if (model.fast() && (state_cache || cur_img_pos.empty()) && !emitted.empty() && getenv("MAYA_GLM_NO_REUSE") == nullptr) {
             const int64_t p = model.position();
             const int64_t full = (int64_t) (prompt.size() + emitted.size());
             if (keep && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {
@@ -2244,15 +2374,17 @@ static int glm_pack_generate(const Options& o) {
                         if (sl.tokens == snap_tokens) sl.anchor = true;
                 }
             }
-            if (p > (int64_t) prompt.size() && p < full && model.snapshot_save()) {
+            if (state_cache && keep) state_publish(snap_tokens, -1, true, extra);
+            if ((p > (int64_t) prompt.size() || (state_cache && p == (int64_t) prompt.size())) && p <= full && model.snapshot_save()) {
                 snap_tokens.assign(prompt.begin(), prompt.end());
                 snap_tokens.insert(snap_tokens.end(), emitted.begin(), emitted.begin() + (p - (int64_t) prompt.size()));
-                snap_img_hash = img_hash(snap_tokens.size());
+                snap_img_hash = extra ? image_hash : img_hash(snap_tokens.size());
                 snap_in_slot = false;
-                std::fprintf(stderr, "glm slots: paused at %lld tokens (%lld written): the state is kept there\n",
+                state_publish(snap_tokens, -1, false, extra, true);
+                std::fprintf(stderr, "glm state: saved at %lld tokens (%lld written): the state is kept there\n",
                              (long long) p, (long long) emitted.size());
             } else if (p > (int64_t) prompt.size()) {
-                std::fprintf(stderr, "glm slots: paused, but the state stands at %lld of %lld tokens: not kept\n",
+                std::fprintf(stderr, "glm state: endpoint stands at %lld of %lld tokens: not kept\n",
                              (long long) p, (long long) full);
             }
         }
@@ -2518,7 +2650,8 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
-        if (pause_req.load() && std::strcmp(finish, "cancel") == 0) pause_snapshot(prompt, emitted, pause_keep.load());
+        if (state_cache || (pause_req.load() && std::strcmp(finish, "cancel") == 0))
+            pause_snapshot(prompt, emitted, pause_req.load() && pause_keep.load());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -2639,6 +2772,8 @@ static int glm_pack_generate(const Options& o) {
         strata::kernels::SamplerParams sp;
         int64_t max_new = 0, produced = 0;
         std::vector<int32_t> prompt, emitted;
+        std::vector<strata::core::statecache::ExtraInput> state_extra;
+        uint64_t state_image_hash = kNoImages;
         std::vector<int32_t> pen;   // the penalties' history (sp.host_history): the prompt, then every token written
         bool in_think = false;
         int64_t think_budget = 0;
@@ -2824,7 +2959,7 @@ static int glm_pack_generate(const Options& o) {
     const auto flush_pauses = [&] {
         for (const auto& d : deferred_pauses) {
             bind_ctx(d.ctx);
-            pause_snapshot(d.prompt, d.emitted, d.keep);
+            pause_snapshot(d.prompt, d.emitted, d.keep, &d.extra, d.image_hash);
             ctxs[(size_t) d.ctx].busy = false;
         }
         deferred_pauses.clear();
@@ -2850,13 +2985,13 @@ static int glm_pack_generate(const Options& o) {
                          (unsigned long long) g.mtp_steps,
                          (double) (g.mtp_steps + g.mtp_acc) / (double) g.mtp_steps);
         bool deferred = false;
-        if (g.pause && std::strcmp(g.finish, "cancel") == 0) {
+        if (state_cache || (g.pause && std::strcmp(g.finish, "cancel") == 0)) {
             if (in_read_gap) {   // (another context's prompt is being read and stays bound: the snapshot after it)
-                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep});
+                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep, std::move(g.state_extra), g.state_image_hash});
                 deferred = true;
             } else {
                 bind_ctx(g.ctx);
-                pause_snapshot(g.prompt, g.emitted, g.keep);
+                pause_snapshot(g.prompt, g.emitted, g.keep, &g.state_extra, g.state_image_hash);
             }
         }
         if (g.produced > 0)
@@ -3195,6 +3330,10 @@ static int glm_pack_generate(const Options& o) {
         model.force_next(-1);
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
+        if (state_cache) {
+            g->state_extra = state_prefix(g->prompt).extra;
+            g->state_image_hash = img_hash(g->prompt.size());
+        }
         tag = std::to_string(rid) + " ";
         // MAYA_GLM_PREFILL_GAPS: the running requests decode at the read's chunk boundaries and between its calls
         // (the split's batched rows: they never bind a context; text prompts only, as interleave)
@@ -7304,6 +7443,43 @@ int main(int argc, char** argv) {
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
             return v;
         };
+        std::unique_ptr<strata::program::QwenStateCache> conversation_states;
+        if (const char* enabled = std::getenv("MAYA_STATE_CACHE"); enabled && std::atoi(enabled)) {
+            int device = 0;
+            cudaGetDevice(&device);
+            std::vector<strata::program::QwenStateCache::Stage> devices{{device, &ss}};
+            for (auto& stage : stages) devices.push_back({stage->dev, &stage->ss});
+            try {
+                auto config = strata::core::statecache::Config::environment(
+                    (std::filesystem::path(o.pack) / "state-cache").string());
+                conversation_states = std::make_unique<strata::program::QwenStateCache>(g, std::move(devices), mtp, config);
+            } catch (const std::exception& e) { std::fprintf(stderr, "maya state cache: %s\n", e.what()); }
+        }
+        const std::string conversation_identity = [&] {
+            std::ostringstream id;
+            id << "qwen-state-1 engine=" << STRATA_VERSION << " pack=" << std::filesystem::absolute(o.pack).string()
+               << " stages=" << n_stages << " kv=" << o.kv;
+            for (auto boundary : split_at) id << " split=" << boundary;
+            std::error_code ec;
+            for (const char* file : {"index.txt", "dense.bin", "native_experts.txt"}) {
+                const auto path = std::filesystem::path(o.pack) / file;
+                id << " " << file << ":" << std::filesystem::file_size(path, ec) << ":"
+                   << std::filesystem::last_write_time(path, ec).time_since_epoch().count();
+            }
+            for (const auto& cv : o.cvec_files) {
+                id << " cv=" << std::filesystem::absolute(cv.first).string() << ":" << cv.second << ":"
+                   << std::filesystem::file_size(cv.first, ec) << ":"
+                   << std::filesystem::last_write_time(cv.first, ec).time_since_epoch().count();
+            }
+            return id.str();
+        }();
+        const auto conversation_prefix = [&](const std::vector<int32_t>& tokens, const std::vector<ImgKey>& images) {
+            strata::core::statecache::Prefix prefix;
+            prefix.identity = conversation_identity + " cvec=" + std::to_string(cvec_cached);
+            prefix.tokens = tokens;
+            for (const auto& image : images) prefix.extra.push_back({uint64_t(image.start), 1, std::to_string(image.hash)});
+            return prefix;
+        };
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
@@ -7315,10 +7491,10 @@ int main(int argc, char** argv) {
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L).
         // `written`: the tokens the session consumed instead of `cur` (a checkpoint inside the answer, at L > n)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr,
-                                 const std::vector<int32_t>* written = nullptr) -> bool {
-            if (o.prompt_cache <= 0 || L < 1) return true;
+                                 const std::vector<int32_t>* written = nullptr, bool frontier = false) -> bool {
+            if ((!conversation_states && o.prompt_cache <= 0) || L < 1) return true;
             for (ConvCheckpoint& c : checks)
-                if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
+                if ((int64_t) c.ids.size() == L && !frontier) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
             if (written != nullptr) {
                 c.ids.assign(written->begin(), written->begin() + L);
@@ -7342,6 +7518,14 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
+            if (conversation_states) {
+                using Running = strata::program::QwenStateCache::Running;
+                std::vector<Running> running{{&c.gdn, &c.ple, &c.tails}};
+                for (const auto& stage : c.stage_parts) running.push_back({&stage.gdn, &stage.ple, &stage.tails});
+                std::string error;
+                conversation_states->publish(conversation_prefix(c.ids, c.imgs), running, error, frontier);
+                if (!error.empty()) std::fprintf(stderr, "maya state cache: capture skipped (%s)\n", error.c_str());
+            }
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -7360,8 +7544,30 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
-            // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
+            // MTP has consumed this full chunk now. Interior stage exports can
+            // become complete recovery units using the matching residual row.
             const int64_t done = p0 + T;
+            if (conversation_states) {
+                std::vector<std::pair<int64_t, std::vector<ConvCheckpoint>>> interior;
+                {
+                    std::lock_guard<std::mutex> lock(part_mu);
+                    for (auto it = part_at.begin(); it != part_at.end() && it->first < done;) {
+                        if (it->first > p0) interior.emplace_back(it->first, std::move(it->second));
+                        it = part_at.erase(it);
+                    }
+                }
+                for (auto& checkpoint : interior) {
+                    bool complete = checkpoint.second.size() == stages.size() + 1;
+                    for (const auto& part : checkpoint.second) complete = complete && !part.gdn.empty();
+                    if (!complete) continue;
+                    conversation_states->remember(checkpoint.first,
+                        R_rows + (checkpoint.first - p0 - 1) * g.hc * g.n_embd);
+                    if (!checkpoint_at(checkpoint.first, &checkpoint.second)) { e = "interior checkpoint assembly failed"; return false; }
+                    pp_next_check = checkpoint.first + o.prompt_cache_every;
+                }
+                conversation_states->remember(done, R_rows + (T - 1) * g.hc * g.n_embd);
+            }
+            // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) pp_from);
@@ -7386,6 +7592,7 @@ int main(int argc, char** argv) {
                 }
                 if (!saved) { e = "saving a conversation checkpoint failed"; return false; }
                 pp_next_check = done + o.prompt_cache_every;
+                if (conversation_states && stages.empty()) part_next[0] = pp_next_check;
             }
             return true;
         };
@@ -7396,7 +7603,7 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
-                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
+                    if ((!conversation_states && o.prompt_cache <= 0) || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
@@ -7404,6 +7611,31 @@ int main(int argc, char** argv) {
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
                     v[i] = std::move(part);
+                    return true;
+                };
+            }
+        }
+        if (conversation_states && o.prompt_cache_every > 0) {
+            for (size_t i = 0; i <= stages.size(); ++i) {
+                auto& stage = i == 0 ? sp : stages[i - 1]->sp;
+                stage.checkpoint_plan = [&, i](uint64_t start, uint64_t end) {
+                    const uint64_t mark = uint64_t(part_next[i]);
+                    std::vector<uint64_t> marks;
+                    if (mark > start && mark <= end) marks.push_back(mark);
+                    if (mark <= UINT64_MAX - uint64_t(o.prompt_cache_every) && mark + uint64_t(o.prompt_cache_every) <= end)
+                        marks.push_back(mark + uint64_t(o.prompt_cache_every));
+                    return strata::core::statecache::plan_export(start, end, marks, 1, true);
+                };
+                stage.on_stage_checkpoint = [&, i](strata::prefill::Prefill::Checkpoint checkpoint, std::string&) {
+                    ConvCheckpoint part;
+                    part.gdn = std::move(checkpoint.gdn);
+                    part.ple = std::move(checkpoint.ple);
+                    part.tails = std::move(checkpoint.tails);
+                    part_next[i] = checkpoint.position + o.prompt_cache_every;
+                    std::lock_guard<std::mutex> lock(part_mu);
+                    auto& parts = part_at[checkpoint.position];
+                    parts.resize(stages.size() + 1);
+                    parts[i] = std::move(part);
                     return true;
                 };
             }
@@ -8053,6 +8285,18 @@ int main(int argc, char** argv) {
                                  live.size(), (long long) k, (long long) resume, checks.size());
                 }
             }
+            if (conversation_states) {
+                std::vector<int32_t> prompt(cur.begin(), cur.end());
+                const int64_t old_resume = resume;
+                std::string error;
+                if (!conversation_states->restore(conversation_prefix(prompt, req_imgs), resume, from_live, error)) {
+                    checks.clear();
+                    std::fprintf(stderr, "maya state cache: restore missed (%s); recomputing\n", error.c_str());
+                } else if (resume > old_resume) {
+                    // Positional backing now belongs to this restored conversation.
+                    checks.clear();
+                }
+            }
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             // (a checkpoint inside an earlier answer below `resume` is of no more use: this request writes the cells
@@ -8162,6 +8406,7 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
+                    if (conversation_states) conversation_states->remember(q + T, ver.final_R_all() + (T - 1) * g.hc * g.n_embd);
                     q += T;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -8366,8 +8611,11 @@ int main(int argc, char** argv) {
                 if (cuda_context_broken(err)) return 1;
                 continue;   // the experts are read again on demand: the next request runs
             }
+            if (!cancelled && conversation_states && n > 1 && !checkpoint_at(n - 1))
+                std::fprintf(stderr, "maya state cache: prompt frontier capture failed\n");
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
+            if (conversation_states) conversation_states->observe(uint64_t(read_from), uint64_t(n - 1), prompt_ms / 1000.);
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
@@ -8513,6 +8761,14 @@ int main(int argc, char** argv) {
                     cancelled = true;   // the session is between two windows: the next request reads it again
                     break;
                 }
+                if (conversation_states) {
+                    conversation_states->remember(p + a + 1, ver.final_R_all() + a * g.hc * g.n_embd);
+                    if (a > 0 && !mtp.prefill(ver.final_R_all(), outv.data(), a, p, err)) {
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR state cache drafter catch-up: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
@@ -8639,7 +8895,9 @@ int main(int argc, char** argv) {
                 // (the checkpoints taken while reading it are still good)
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
-                live_ok = o.prompt_cache > 0;
+                live_ok = o.prompt_cache > 0 || bool(conversation_states);
+                if (conversation_states && !checkpoint_at(int64_t(live.size()), nullptr, &live, true))
+                    std::fprintf(stderr, "maya state cache: completed frontier capture failed\n");
             }
             if (window_failed) continue;   // the ERR was reported: the engine lives, the next request runs
             static const bool state_hash = std::getenv("MAYA_STATE_HASH") != nullptr;

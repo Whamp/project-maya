@@ -58,6 +58,7 @@
 #include "mm3_pack.hpp"
 #include "mm3_sample.hpp"
 #include "mm3_slots.hpp"
+#include "mm3_conversation_cache.hpp"
 #include "mm3_vision.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -375,6 +376,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         const char* e = ::mm3::env("MM3_LOOKUP_TRUST");
         return e == nullptr || std::atoi(e) != 0;
     }();
+    mm3::ConversationCache state_cache(m);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
@@ -440,7 +442,10 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         const bool abl = m.ablate_loaded() && (r.ablate >= 0 ? r.ablate != 0 : abl_default);
         if (m.ablate_loaded() && abl != m.ablating()) from = 0;
         m.set_ablate(abl);
-        state.resize(from);
+        bool restored = false;
+        from = state_cache.restore(r.ids, pics, from, restored);
+        if (restored) state.assign(r.ids.begin(), r.ids.begin() + from);
+        else state.resize(from);
         held.clear();
         std::vector<mm3::Model::Image> rows;
         if (!(pics.empty() && std::find(r.ids.begin(), r.ids.end(), m.vision() ? m.vision()->image_token : -1) ==
@@ -488,6 +493,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             }
             const int done = whole ? m.done() : T;
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + done);
+            state_cache.publish(state, held, true);
             a += (size_t) done;
             if (!whole || T <= 16) pp_line(a);   // (a short call: a window, no chunks reported)
             if (done < T || (in.stop.load() && !last)) {
@@ -496,6 +502,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             }
         }
         const double t1 = now() * 1e3;
+        state_cache.observe(from, state.size(), (t1 - t0) / 1000.);
         m.set_images({});
         if (!ok) {
             std::printf("ERR %s\n", err.c_str());
@@ -745,6 +752,7 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             state.clear();
             held.clear();
         }
+        state_cache.publish(state, held);
         stat_line();
         const double t2 = now() * 1e3;
         const auto& se = m.stats();
@@ -782,6 +790,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
                 const std::string& profile_out) {
     const int N = m.seqs();
     serve_header(m, false, kv_fmt);
+    mm3::ConversationCache state_cache(m);
     const bool abl_default = m.ablating();   // (a GEN without ablate=: as the engine started)
     std::printf("READY %d stop multi=%d\n", m.max_ctx(), N);
     std::fflush(stdout);
@@ -848,6 +857,8 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
     };
     // a request's end: its DONE line (the engine's counters over its decode are shared with the others meanwhile)
     auto finish = [&](Gen& g) {
+        m.bind(g.seq);
+        state_cache.publish(seqs[size_t(g.seq)].state, seqs[size_t(g.seq)].held);
         const double t2 = now() * 1e3;
         const auto& se = m.stats();
         const long long look = se.profiled - g.prof0, cpu = se.cpu_experts - g.cpu0;
@@ -1083,7 +1094,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
             views[(size_t) s].from = from;
         }
         const int best = mm3::pick_slot(views);
-        const size_t bfrom = best >= 0 ? views[(size_t) best].from : 0;
+        size_t bfrom = best >= 0 ? views[(size_t) best].from : 0;
         if (best < 0) {   // (every sequence busy - the server sends at most n at once: after one ends)
             waiting.push_back(line);
             return;
@@ -1091,6 +1102,11 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         if (stages > 1) drain();   // (the pipeline empty: the prompt's forwards and its pictures use every GPU)
         if (run.empty()) in.stop.store(false);   // (a STOP for all before this request: nothing it could stop)
         Seq& S = seqs[(size_t) best];
+        m.bind(best);
+        m.set_ablate(abl);
+        bool restored = false;
+        bfrom = state_cache.restore(r.ids, pics, bfrom, restored);
+        if (restored) S.state.assign(r.ids.begin(), r.ids.begin() + bfrom);
         S.busy = true;
         auto gp = std::make_unique<Gen>();
         Gen& g = *gp;
@@ -1128,6 +1144,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
                 break;
             }
             S.state.insert(S.state.end(), ids.begin() + (long) a, ids.begin() + (long) a + T);
+            state_cache.publish(S.state, S.held, true);
             a += (size_t) T;
             const double ms = now() * 1e3 - g.t0;
             std::printf("PP %d %zu %zu %.1f %.1f %zu\n", g.rid, a, ids.size(), ms,
@@ -1142,6 +1159,7 @@ int serve_multi(mm3::Model& m, const std::vector<int>& eos, int chunk, const std
         }
         m.set_images({});
         g.t1 = now() * 1e3;
+        state_cache.observe(bfrom, S.state.size(), (g.t1 - g.t0) / 1000.);
         if (!ok) {
             std::printf("ERR %d %s\n", g.rid, err.c_str());
             std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", g.rid, ids.size());

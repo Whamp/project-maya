@@ -9,6 +9,7 @@
 //   renormalised), the routed experts (EXL3 sets: the resident ones in one pass, the staged ones in passes of the
 //   staging slots), the shared expert, h += 2.0 * routed + shared
 #include "mm3_model.hpp"
+#include "mm3_state_cache.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -353,6 +354,23 @@ std::string tune_key_of(const std::vector<int>& gpus) {
 }  // namespace
 
 struct Model::Impl {
+    std::vector<int> state_ends;
+    bool state_buffers(int n, bool loading, std::vector<StateDevice>& devices, std::string& error) {
+        if (n <= 0 || n > o.max_ctx || (!loading && (size_t(bound) >= state_ends.size() || n > state_ends[size_t(bound)]))) {
+            error = "MiniMax checkpoint endpoint has not been written"; return false;
+        }
+        devices.resize(D.size());
+        for (size_t i = 0; i < D.size(); ++i) devices[i].device = D[i].id;
+        for (size_t i = 0; i < L.size(); ++i) {
+            auto& layer = L[i];
+            auto& device = devices[size_t(layer.dev)];
+            kv_state_regions("layer-" + std::to_string(i), n, g.n_kv, g.ix_dim,
+                             layer.kc, layer.vc, layer.ic, layer.kvq, layer.kvh, device.regions);
+            if (layer.kvh.ring) device.tags.push_back({layer.kvh.tag, size_t(layer.kvh.ring) * sizeof(int)});
+        }
+        if (draftm && o.seqs == 1 && !draftm->state_regions(n, devices[size_t(head_dev)].regions, error, loading)) return false;
+        return true;
+    }
     Options o;
     Pack pk;
     Geo g;
@@ -3003,6 +3021,8 @@ struct Model::Impl {
                 issue_promotions(d);
             }
         if (RL > 0) {
+            state_ends.resize(size_t(std::max(1, o.seqs)));
+            for (int r = 0; r < RL; ++r) state_ends[size_t(last.seq[size_t(r)])] = last.pos[size_t(r)] + 1;
             pout.emplace_back(last.tag, std::vector<float>(hd.lg_h, hd.lg_h + (size_t) RL * g.vocab));
             pst[(size_t) S - 1].tag = -1;
         }
@@ -3426,6 +3446,44 @@ bool Model::save_profile(const std::string& path, std::string& err) const {
     return true;
 }
 
+std::string Model::state_directory() const { return tpe ? tpe->state_directory() : p->o.pack + "/state-cache"; }
+std::string Model::state_identity() const {
+    if (tpe) return tpe->state_identity();
+    return mm3::state_identity(p->pk, p->g, p->o, "layer-split");
+}
+bool Model::state_sources(const statecache::Prefix& prefix, std::vector<statecache::RegionSource>& out, std::string& error) {
+    if (tpe) return tpe->state_sources(prefix, out, error);
+    std::vector<StateDevice> devices;
+    return p->state_buffers(int(prefix.tokens.size()), false, devices, error) &&
+           sources_state_buffers(state_identity(), devices, out, error);
+}
+bool Model::state_load(statecache::StateCache& cache, const statecache::StateCache::Lease& lease, std::string& error) {
+    if (tpe) return tpe->state_load(cache, lease, error);
+    std::vector<StateDevice> devices;
+    const int n = int(lease.tokens());
+    const bool ok = p->state_buffers(n, true, devices, error) && load_state_buffers(state_identity(), devices, cache, lease, error);
+    p->state_ends.resize(size_t(seqs()));
+    p->state_ends[size_t(p->bound)] = ok ? n : 0;
+    if (p->draftm && p->o.seqs == 1) p->draftm->state_loaded(ok ? n : 0);
+    return ok;
+}
+bool Model::state_capture(statecache::Capture& out, const statecache::Prefix& prefix, std::string& error, size_t budget) {
+    if (tpe) return tpe->state_capture(out, prefix, error, budget);
+    std::vector<StateDevice> devices;
+    return p->state_buffers(int(prefix.tokens.size()), false, devices, error) &&
+           capture_state_buffers(state_identity(), prefix, devices, out, budget, error);
+}
+bool Model::state_restore(const statecache::Prefix& prefix, const std::vector<statecache::Region>& regions, std::string& error) {
+    if (tpe) return tpe->state_restore(prefix, regions, error);
+    std::vector<StateDevice> devices;
+    const int n = int(prefix.tokens.size());
+    const bool ok = p->state_buffers(n, true, devices, error) && restore_state_buffers(state_identity(), devices, regions, error);
+    p->state_ends.resize(size_t(seqs()));
+    p->state_ends[size_t(p->bound)] = ok ? n : 0;
+    if (ok && p->draftm && p->o.seqs == 1) p->draftm->state_loaded(n);
+    return ok;
+}
+
 bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err) {
     if (tpe) return tpe->forward(ids, n, pos0, want, logits_out, err);
     p->last_done = 0;
@@ -3446,6 +3504,8 @@ bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out
             return false;
     }
     p->last_done = n;
+    p->state_ends.resize(size_t(seqs()));
+    p->state_ends[size_t(p->bound)] = pos0 + n;
     return true;
 }
 
@@ -3505,7 +3565,11 @@ bool Model::forward_rows(const int* ids, const int* seq, const int* pos, int R, 
     const bool ok = p->chunk(ids, R, 0, R, logits_out, err);
     p->rseq.clear();
     p->rpos.clear();
-    if (ok) p->last_done = R;
+    if (ok) {
+        p->last_done = R;
+        p->state_ends.resize(size_t(seqs()));
+        for (int r = 0; r < R; ++r) p->state_ends[size_t(seq[r])] = pos[r] + 1;
+    }
     return ok;
 }
 

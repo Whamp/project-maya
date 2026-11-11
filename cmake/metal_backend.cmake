@@ -6,10 +6,14 @@
 #   -DMAYA_GGML_DIR=<llama.cpp>       a checkout at the pinned commit (default: fetched)
 #   -DMAYA_METAL_TESTS=OFF            leave out the parity tests (the setup does)
 #   -DMAYA_METAL_PORTABLE=ON          no -mcpu=native (a build for other Macs)
-if(NOT APPLE)
+option(MAYA_METAL_CPU_ONLY "Build the Metal graph's CPU oracle without an Apple GPU" OFF)
+if(NOT APPLE AND NOT MAYA_METAL_CPU_ONLY)
   message(FATAL_ERROR "MAYA_ENABLE_METAL builds for macOS on Apple Silicon")
 endif()
-enable_language(C OBJC)
+enable_language(C)
+if(NOT MAYA_METAL_CPU_ONLY)
+  enable_language(OBJC)
+endif()
 
 option(MAYA_METAL_TESTS "Build maya-metal's parity tests" ON)
 option(MAYA_METAL_PORTABLE "Build maya-metal for any Apple Silicon Mac" OFF)
@@ -17,7 +21,11 @@ set(MAYA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fe
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_STATIC ON CACHE BOOL "" FORCE)
-set(GGML_METAL ON CACHE BOOL "" FORCE)
+if(MAYA_METAL_CPU_ONLY)
+  set(GGML_METAL OFF CACHE BOOL "" FORCE)
+else()
+  set(GGML_METAL ON CACHE BOOL "" FORCE)
+endif()
 set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)   # the shaders live inside the binary: nothing to install
 set(GGML_CUDA OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
@@ -105,11 +113,15 @@ endif()
 # the engine reports Maya's release (VERSION) as its version
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _maya_version LIMIT_COUNT 1)
 add_library(maya_metal STATIC src/metal/glm_metal.cpp src/metal/glm_metal_load.cpp src/metal/expert_pool.cpp
+                              src/metal/state_cache.cpp
                               src/metal/glm_metal_dflash.cpp src/metal/spec.cpp src/metal/sampler.cpp
                               src/metal/mm3_metal.cpp src/metal/mm3_metal_load.cpp src/metal/mm3_serve.cpp)
 target_include_directories(maya_metal PUBLIC src/metal)
 target_compile_definitions(maya_metal PUBLIC MAYA_VERSION="${_maya_version}")
-target_link_libraries(maya_metal PUBLIC ggml ggml-base ggml-cpu ggml-metal)
+target_link_libraries(maya_metal PUBLIC ggml ggml-base ggml-cpu strata_state_cache)
+if(NOT MAYA_METAL_CPU_ONLY)
+  target_link_libraries(maya_metal PUBLIC ggml-metal)
+endif()
 if(_maya_mla)
   target_compile_definitions(maya_metal PRIVATE MAYA_METAL_SPARSE_MLA=1)
 endif()
@@ -128,7 +140,11 @@ if(MAYA_METAL_TESTS)
     target_include_directories(metal_allocator_free_blocks_test PRIVATE
       ${_maya_mla_copy}/include ${_maya_mla_copy}/src)
     target_compile_options(metal_allocator_free_blocks_test PRIVATE -ffunction-sections -fdata-sections)
-    target_link_options(metal_allocator_free_blocks_test PRIVATE -Wl,-dead_strip)
+    if(APPLE)
+      target_link_options(metal_allocator_free_blocks_test PRIVATE -Wl,-dead_strip)
+    else()
+      target_link_options(metal_allocator_free_blocks_test PRIVATE -Wl,--gc-sections)
+    endif()
     add_test(NAME metal_allocator_free_blocks COMMAND metal_allocator_free_blocks_test)
   endif()
   # the CUDA engine's GLM gates (src/core/glm_model_test.cpp, glm_model_big_test.cpp) on maya-metal
@@ -150,6 +166,8 @@ if(MAYA_METAL_TESTS)
   # (tools/mm3_metal_fixture.py needs numpy, like the GLM fixture generators)
   add_executable(metal_mm3_test src/metal/metal_mm3_test.cpp)
   target_link_libraries(metal_mm3_test PRIVATE maya_metal)
+  add_executable(metal_state_cache_test tests/metal_state_cache_test.cpp)
+  target_link_libraries(metal_state_cache_test PRIVATE maya_metal)
   find_program(MAYA_MM3_PYTHON3 python3)
   if(MAYA_MM3_PYTHON3)
     add_test(NAME metal_mm3_gen
@@ -164,6 +182,9 @@ if(MAYA_METAL_TESTS)
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf.expected.bin)
     set_tests_properties(metal_mm3_test_cpu PROPERTIES ENVIRONMENT MAYA_MM3_CPU=1)
     set_tests_properties(metal_mm3_test metal_mm3_test_cpu PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+    add_test(NAME metal_state_cache_test COMMAND metal_state_cache_test
+             ${CMAKE_CURRENT_SOURCE_DIR}/data/glm5-synth.gguf ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_state_cache_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
     add_test(NAME metal_mm3_serve_test
              COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
                      ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)

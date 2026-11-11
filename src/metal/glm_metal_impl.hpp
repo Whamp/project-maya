@@ -65,13 +65,15 @@ struct LayerState {             // what a layer keeps between tokens
     ggml_tensor* conv_snap = nullptr;   // KDA: snapshot copies
     ggml_tensor* ssm_snap = nullptr;
     ggml_tensor* conv_win = nullptr;    // KDA, verify window: [dc + W, d_inner, 3] the conv inputs of the window
-    ggml_tensor* ssm_win = nullptr;     // KDA, verify window: [S*S*H, W] the state after each row, newest first
+    ggml_tensor* ssm_before = nullptr;  // one recurrence at the start of a verify window
+    ggml_tensor *win_q = nullptr, *win_k = nullptr, *win_v = nullptr, *win_g = nullptr, *win_beta = nullptr;
 };
 
 struct GlmMetal::Impl {
     GlmOptions o;
     GlmGeometry g;
     GlmStats st;
+    std::string model_path;
 
     // files
     std::vector<gguf_context*> ggufs;
