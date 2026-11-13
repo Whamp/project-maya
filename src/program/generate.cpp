@@ -1957,6 +1957,16 @@ static int glm_pack_generate(const Options& o) {
             for (const auto& pv : model.pool_vram()) d.push_back(pv.dev);
         return d;
     };
+    // One request at a time, the prompt's snapshot is published once its first token is out, not before (the
+    // snapshot buffer and the rows before it stay as they are until the request's end saves the next one).
+    bool defer_snapshot = false;
+    std::vector<int32_t> pending_snapshot;
+    const auto publish_pending = [&] {
+        if (pending_snapshot.empty()) return;
+        const auto tokens = std::move(pending_snapshot);
+        pending_snapshot.clear();
+        if (tokens == snap_tokens) state_publish(tokens);
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -2315,7 +2325,8 @@ static int glm_pack_generate(const Options& o) {
                     snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
-                    state_publish(snap_tokens);
+                    if (defer_snapshot && state_cache) pending_snapshot = snap_tokens;
+                    else state_publish(snap_tokens);
                 } else {
                     snap_tokens.clear();
                 }
@@ -2446,7 +2457,11 @@ static int glm_pack_generate(const Options& o) {
         size_t reuse = 0;
         const char* finish = "length";
         auto t0 = std::chrono::steady_clock::now();
-        if (prep_prompt(prompt, reuse, finish, t0) != 0) return 1;
+        pending_snapshot.clear();
+        defer_snapshot = true;
+        const int prepared = prep_prompt(prompt, reuse, finish, t0);
+        defer_snapshot = false;
+        if (prepared != 0) return 1;
         std::vector<float> lg;
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
@@ -2479,6 +2494,7 @@ static int glm_pack_generate(const Options& o) {
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
             ++produced;
+            if (produced == 1 && !pending_snapshot.empty()) { std::fflush(stdout); publish_pending(); }
             emitted.push_back((int32_t) tok);
             if (sp.host_history != nullptr) pen_hist.push_back((int32_t) tok);   // (fed next: the picks after count it)
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
@@ -2650,6 +2666,7 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
+        publish_pending();   // (a request that wrote no token)
         if (state_cache || (pause_req.load() && std::strcmp(finish, "cancel") == 0))
             pause_snapshot(prompt, emitted, pause_req.load() && pause_keep.load());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)

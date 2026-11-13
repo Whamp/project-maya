@@ -117,7 +117,7 @@ def run(exe: str, size: int, args: argparse.Namespace, config: dict, tok) -> dic
             if engine.err_path:
                 os.unlink(engine.err_path)
         return {"exe": exe, "size": size, "ready_s": ready_s, "rows": rows,
-                "engine_log": [line for line in log if "state" in line.lower()][-60:]}
+                "engine_log": [line for line in log if "state" in line.lower() or "publish" in line.lower()][-200:]}
 
 
 def main() -> int:
