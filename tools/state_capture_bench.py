@@ -100,8 +100,11 @@ def run(exe: str, size: int, args: argparse.Namespace, config: dict, tok) -> dic
             rows["A2"] = ask(engine, a2, args.output, args)
         finally:
             engine.quit(timeout=300)
+            log = Path(engine.err_path).read_text(errors="replace").splitlines() if engine.err_path else []
+            if engine.err_path:
+                os.unlink(engine.err_path)
         return {"exe": exe, "size": size, "ready_s": ready_s, "rows": rows,
-                "log_tail": [line for line in engine.other if "state cache" in line][-20:]}
+                "engine_log": [line for line in log if "state" in line.lower()][-60:]}
 
 
 def main() -> int:

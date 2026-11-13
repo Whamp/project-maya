@@ -7,7 +7,11 @@ namespace strata::core::statecache {
 // A logical region may span physical pages, heads, or an overlaid KV view.
 // Only written bytes belong here. No padding or capacity beyond the endpoint is copied.
 struct Segment { void* address = nullptr; size_t bytes = 0; };
-struct MemoryRegion { std::string name; std::vector<Segment> segments; };
+// rows: append-only rows (RegionSource::rows); a one-segment device region then also offers GPU fingerprints.
+struct MemoryRegion { std::string name; std::vector<Segment> segments; bool rows = false; };
+
+// The fingerprint (statecache::fingerprint) of each `chunk`-byte piece of a device range, on the current device.
+bool device_fingerprints(const void* data, uint64_t bytes, size_t chunk, std::vector<uint64_t>& out, std::string& error);
 
 // Call after the producer stream completes. Transfers use bounded double-buffered
 // pinned staging; returned captures own their bytes independently of the live sequence.

@@ -17,7 +17,13 @@ COUNTERS = {
     "calibration_samples",
     "ram_hits",
     "disk_hits",
-    "remote_hits",
+    "publishes",
+    "publish_ms",
+    "read_bytes",
+    "reused_bytes",
+    "hashed_bytes",
+    "restores",
+    "restore_ms",
 }
 GAUGES = {
     "units",

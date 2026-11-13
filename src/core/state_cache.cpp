@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdio>
 #include <deque>
+#include <random>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -39,11 +40,6 @@ struct Elapsed {   // adds the wall time of a scope to a counter
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~Elapsed() { total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
 };
-uint64_t hash(std::span<const uint8_t> b) {
-    uint64_t h = 1469598103934665603ull;
-    for (uint8_t v : b) h = (h ^ v) * 1099511628211ull;
-    return h;
-}
 double number(const char* key, double fallback) {
     const char* value = std::getenv(key);
     if (!value) return fallback;
@@ -254,10 +250,13 @@ Config Config::environment(const std::string& dir, const std::string& family) {
 std::shared_ptr<Storage> file_storage(const std::string& path) { return std::make_shared<Files>(path); }
 RegionSource bytes_source(std::string name, Bytes bytes) {
     auto owned = std::make_shared<const Bytes>(std::move(bytes));
-    return {std::move(name), owned->size(), [owned](uint64_t at, uint8_t* data, size_t n, std::string& error) {
+    RegionSource source;
+    source.name = std::move(name); source.bytes = owned->size();
+    source.read = [owned](uint64_t at, uint8_t* data, size_t n, std::string& error) {
         if (at > owned->size() || n > owned->size()-at) { error = "state sideband range invalid"; return false; }
         std::memcpy(data, owned->data()+at, n); return true;
-    }};
+    };
+    return source;
 }
 RegionTarget check_region(std::string name, Bytes bytes) {
     auto expected = std::make_shared<const Bytes>(std::move(bytes));
@@ -269,9 +268,30 @@ RegionTarget check_region(std::string name, Bytes bytes) {
     }};
 }
 
+uint64_t fingerprint(const void* data, size_t bytes) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    const auto mix = [](uint64_t z) {
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+        return z ^ (z >> 31);
+    };
+    uint64_t sum = mix(bytes);
+    const size_t words = bytes / 8;
+    for (size_t i = 0; i < words; ++i) {
+        uint64_t w; std::memcpy(&w, p + 8 * i, 8);
+        sum += mix(w ^ (uint64_t(i) * 0x9e3779b97f4a7c15ull));
+    }
+    if (bytes % 8) {
+        uint64_t w = 0; std::memcpy(&w, p + 8 * words, bytes % 8);
+        sum += mix(w ^ (uint64_t(words) * 0x9e3779b97f4a7c15ull));
+    }
+    return sum;
+}
+
 struct Chunk {
-    std::string key;
-    uint64_t checksum = 0, size = 0;
+    std::string key;   // its object name in storage, unique to this chunk
+    uint64_t size = 0, print = 0;
+    bool printed = false;   // `print` holds the bytes' fingerprint
     std::shared_ptr<const Bytes> data;
     bool stored = false;
     bool reserved_ram = false, reserved_disk = false;
@@ -285,7 +305,6 @@ struct StateCache::Unit {
     uint64_t uses = 0;
     uint64_t min_prompt_tokens = 0;
     bool sampling_ready = false, anchor = false, frontier = false, ram = true, stored = false, pending = false, dead = false;
-    bool imported = false;
 };
 
 struct StateCache::Impl {
@@ -295,14 +314,9 @@ struct StateCache::Impl {
     mutable std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, std::shared_ptr<Unit>> units;
-    std::unordered_map<uint64_t, std::vector<std::weak_ptr<Chunk>>> chunks;
     struct Job {
-        std::shared_ptr<Unit> unit;
-        char operation = 'W';
-        std::string key;
-        Job() = default;
-        Job(std::shared_ptr<Unit> u) : unit(std::move(u)) {}
-        Job(char op, std::string id) : operation(op), key(std::move(id)) {}
+        std::shared_ptr<Unit> unit;   // write this unit's chunks and manifest
+        std::string touch;            // or refresh this manifest's age
         bool payload_ready = false;
     };
     std::deque<Job> writes;
@@ -311,6 +325,8 @@ struct StateCache::Impl {
     double cost_xx = 0, cost_xy = 0, cost_yy = 0, cost_xt = 0, cost_yt = 0;
     bool stopping = false;
     std::thread worker;
+    std::string salt;
+    uint64_t named = 0;
 
     Impl(Config c, std::shared_ptr<Storage> s, std::function<double()> now)
         : config(std::move(c)), storage(std::move(s)), clock(std::move(now)) {
@@ -319,14 +335,8 @@ struct StateCache::Impl {
         stats.cost_per_token_per_100k = config.cost.per_token_per_100k;
         if (!clock) clock = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         if (!storage && !config.directory.empty() && config.disk_bytes) storage = file_storage(config.directory);
-        if (const char* backend = std::getenv("MAYA_STATE_BACKEND"); backend && std::string(backend) != "local") {
-            if (std::string(backend) != "mooncake") throw std::invalid_argument("unknown MAYA_STATE_BACKEND");
-#ifdef STRATA_STATE_MOONCAKE
-            storage = mooncake_storage(std::move(storage));
-#else
-            throw std::invalid_argument("Mooncake transport is unavailable in this build; use MAYA_STATE_BACKEND=local");
-#endif
-        }
+        std::random_device random;
+        char buf[24]; std::snprintf(buf, sizeof(buf), "%08x%08x", random(), random()); salt = buf;
         if (storage) {
             recover(); trim();
             std::vector<std::string> live;
@@ -336,10 +346,6 @@ struct StateCache::Impl {
             }
             std::string error;
             storage->prune(live, error);
-            if (storage->shared() && config.write_through) for (auto& [key, unit] : units) {
-                (void) key;
-                unit->pending = true; writes.push_back(unit);
-            }
             worker = std::thread([this] { run(); });
         }
     }
@@ -347,9 +353,31 @@ struct StateCache::Impl {
         { std::lock_guard lock(mutex); stopping = true; cv.notify_all(); }
         if (worker.joinable()) worker.join();
     }
-    void control(char operation, const std::string& key) {
+    void touch_later(const std::string& key) {
         if (writes.size() >= 65536) { ++stats.write_failures; return; }
-        writes.emplace_back(operation, key); cv.notify_one();
+        Job job; job.touch = key; writes.push_back(std::move(job)); cv.notify_one();
+    }
+    std::string chunk_name() {
+        char buf[48]; std::snprintf(buf, sizeof(buf), "chunk-%s-%llx", salt.c_str(), (unsigned long long) ++named);
+        return buf;
+    }
+    // Caller holds the lock; the chunk's bytes are immutable.
+    uint64_t print_of(Chunk& c, const Bytes& bytes) {
+        if (!c.printed) { c.print = fingerprint(bytes.data(), bytes.size()); c.printed = true; stats.hashed_bytes += bytes.size(); }
+        return c.print;
+    }
+    // Reads one stored chunk and checks it. The caller does not hold the lock.
+    std::shared_ptr<const Bytes> load(const Chunk& c, std::string& error) {
+        Bytes b;
+        if (!storage || !storage->get(c.key, b, error) || b.size() != c.size) {
+            if (error.empty()) error = "missing state object " + c.key;
+            return {};
+        }
+        const uint64_t print = fingerprint(b.data(), b.size());
+        std::lock_guard lock(mutex);
+        stats.hashed_bytes += b.size();
+        if (!c.printed || print != c.print) { error = "state object checksum mismatch: " + c.key; return {}; }
+        return std::make_shared<const Bytes>(std::move(b));
     }
 
     std::set<const Chunk*> holders(const Unit& u) const {
@@ -362,7 +390,7 @@ struct StateCache::Impl {
         stats.unique_bytes = stats.shared_bytes = stats.pinned_units = 0;
         stats.pending_writes = 0;
         stats.pending_updates = active_updates;
-        for (const auto& job : writes) stats.pending_updates += job.operation != 'W';
+        for (const auto& job : writes) stats.pending_updates += !job.unit;
         stats.units = units.size();
         std::set<const Chunk*> seen;
         for (const auto& [key, u] : units) {
@@ -426,11 +454,7 @@ struct StateCache::Impl {
                 if (!other->dead && extends(other->prefix, old.prefix) &&
                     !extends(newest.prefix, other->prefix) && !extends(other->prefix, newest.prefix)) branch = true;
             }
-            if (branch) continue;
-            old.dead = true;
-            if (storage && storage->shared() && old.stored) {
-                control('D', old.key);
-            }
+            if (!branch) old.dead = true;
         }
     }
     int tier(const Unit& unit) const {
@@ -456,30 +480,39 @@ struct StateCache::Impl {
     }
     bool pinned(const std::shared_ptr<Unit>& unit) const { return unit.use_count() > 1 || unit->pending; }
 
-    Bytes manifest(const Unit& u) const {
-        Bytes b; put(b, std::string("MAYASTATE3")); put(b, u.prefix.identity);
+    // What names a state: its prefix and the flags a lookup depends on.
+    static Bytes identity(const Unit& u) {
+        Bytes b; put(b, std::string("MAYASTATE4")); put(b, u.prefix.identity);
         put(b, u.prefix.tokens.size()); for (int32_t t : u.prefix.tokens) put(b, uint32_t(t));
         put(b, u.prefix.extra.size());
         for (const auto& x : u.prefix.extra) { put(b, x.position); put(b, x.length); put(b, x.identity); }
-        put(b, u.sampling_ready); put(b, u.anchor); put(b, u.frontier); put(b, u.min_prompt_tokens); put(b, u.parts.size());
+        put(b, u.sampling_ready); put(b, u.anchor); put(b, u.frontier); put(b, u.min_prompt_tokens);
+        return b;
+    }
+    static std::string unit_key(const Unit& u) {
+        const Bytes b = identity(u);
+        return "unit-" + content_digest(b.data(), b.size()) + ".state";
+    }
+    // Every chunk's fingerprint must be known.
+    static Bytes manifest(const Unit& u) {
+        Bytes b = identity(u); put(b, u.parts.size());
         for (const auto& p : u.parts) {
             put(b, p.name); put(b, p.chunks.size());
-            for (const auto& c : p.chunks) { put(b, c->key); put(b, c->checksum); put(b, c->size); }
+            for (const auto& c : p.chunks) { put(b, c->key); put(b, c->print); put(b, c->size); }
         }
-        put(b, hash(b)); return b;
+        put(b, fingerprint(b.data(), b.size())); return b;
     }
-    void recover(const std::vector<std::string>* candidates = nullptr) {
+    void recover() {
         std::string error;
-        const auto keys = candidates ? *candidates : storage->manifests(error);
-        for (const auto& key : keys) {
+        std::map<std::string, std::shared_ptr<Chunk>> known;
+        for (const auto& key : storage->manifests(error)) {
             if (units.count(key)) continue;
             if (storage->age_seconds(key) > config.max_age_seconds) continue;
             Bytes b;
             if (!storage->get(key, b, error)) continue;
             try {
-                if (b.size() < 8 || key != "unit-" + content_digest(b.data(), b.size()) + ".state") continue;
                 Reader r{b};
-                if (r.s() != "MAYASTATE3") continue;
+                if (r.s() != "MAYASTATE4") continue;
                 auto u = std::make_shared<Unit>(); u->key = key; u->prefix.identity = r.s();
                 const size_t n = r.count(8);
                 for (size_t i = 0; i < n; ++i) u->prefix.tokens.push_back(int32_t(r.n()));
@@ -491,19 +524,21 @@ struct StateCache::Impl {
                 for (size_t i = 0; i < np; ++i) {
                     Part p; p.name = r.s(); const size_t nc = r.count(24);
                     for (size_t j = 0; j < nc; ++j) {
-                        const std::string ck = r.s(); const auto sum = r.n(), size = r.n();
+                        const std::string ck = r.s(); const auto print = r.n(), size = r.n();
                         if (!size || size > config.chunk_bytes) throw std::runtime_error("invalid state chunk size");
-                        std::shared_ptr<Chunk> found;
-                        for (auto& w : chunks[sum]) if (auto c = w.lock(); c && c->key == ck && c->size == size) found = std::move(c);
-                        if (!found) { found = std::make_shared<Chunk>(); found->key = ck; found->checksum = sum; found->size = size; found->stored = true; chunks[sum].push_back(found); }
-                        p.chunks.push_back(std::move(found));
+                        auto& found = known[ck];
+                        if (!found) {
+                            found = std::make_shared<Chunk>(); found->key = ck; found->print = print; found->printed = true;
+                            found->size = size; found->stored = true;
+                        }
+                        if (found->print != print || found->size != size) throw std::runtime_error("conflicting state chunk");
+                        p.chunks.push_back(found);
                     }
                     u->parts.push_back(std::move(p));
                 }
-                const auto expected = hash(std::span<const uint8_t>(b).first(r.at));
-                if (r.n() != expected || r.at != b.size()) continue;
-                u->ram = false; u->stored = true; u->imported = candidates != nullptr;
-                u->used_at = clock(); units[key] = std::move(u);
+                const auto expected = fingerprint(b.data(), r.at);
+                if (r.n() != expected || r.at != b.size() || unit_key(*u) != key) continue;
+                u->ram = false; u->stored = true; u->used_at = clock(); units[key] = std::move(u);
             } catch (const std::exception&) { ++stats.read_failures; }
         }
         account();
@@ -512,69 +547,35 @@ struct StateCache::Impl {
     void run() {
         for (;;) {
             Job job;
-            std::shared_ptr<Unit> u;
             { std::unique_lock lock(mutex); cv.wait(lock, [&] { return stopping || !writes.empty(); });
               if (writes.empty()) { if (stopping) return; else continue; }
               job = std::move(writes.front()); writes.pop_front(); ++active_jobs;
-              active_updates += job.operation != 'W'; }
-            if (job.operation != 'W') {
+              active_updates += !job.unit; }
+            if (!job.unit) {
                 bool ok = true;
-                try {
-                    if (job.operation == 'T') storage->touch(job.key);
-                    else if (job.operation == 'X') storage->invalidate(job.key);
-                    else storage->dead(job.key);
-                } catch (const std::exception&) { ok = false; }
-                { std::lock_guard lock(mutex);
-                  --active_jobs; --active_updates;
-                  if (!ok) {
-                      ++stats.write_failures;
-                      const auto found = units.find(job.key);
-                      if (job.operation == 'T' && found != units.end() && !found->second->dead && !found->second->imported) {
-                          found->second->stored = false;
-                          if (!found->second->pending && config.write_through) {
-                              found->second->pending = true; writes.emplace_back(found->second);
-                          }
-                      }
-                  }
+                try { storage->touch(job.touch); } catch (const std::exception&) { ok = false; }
+                { std::lock_guard lock(mutex); --active_jobs; --active_updates;
+                  if (!ok) ++stats.write_failures;
                   cv.notify_all(); }
                 continue;
             }
-            u = std::move(job.unit);
+            auto u = std::move(job.unit);
             std::string error;
             bool ok = true;
             try {
               if (!job.payload_ready) for (const auto& p : u->parts) for (const auto& c : p.chunks) {
                 std::shared_ptr<const Bytes> data;
-                { std::lock_guard lock(mutex); if (c->stored && !storage->shared()) continue; data = c->data; }
-                if (!data && storage->shared()) {
-                    Bytes loaded;
-                    if (storage->get(c->key, loaded, error) && loaded.size() == c->size &&
-                        content_digest(loaded.data(), loaded.size()) == c->key.substr(6))
-                        data = std::make_shared<const Bytes>(std::move(loaded));
-                }
+                { std::lock_guard lock(mutex);
+                  if (c->stored) continue;
+                  data = c->data;
+                  if (data) print_of(*c, *data); }
                 if (!data || !storage->put(c->key, *data, error)) { ok = false; break; }
                 { std::lock_guard lock(mutex); c->stored = true; }
               }
-              if (ok && !job.payload_ready) { const Bytes b = manifest(*u); ok = storage->put(u->key, b, error); }
-              if (ok) {
-                  Storage::Publication publication; publication.key = u->key; publication.prefix = u->prefix; publication.frontier = u->frontier;
-                  { std::lock_guard lock(mutex);
-                    publication.value = config.cost.seconds(0, u->prefix.tokens.size());
-                    size_t parent_n = 0;
-                    for (const auto& [key, other] : units)
-                        if (!other->dead && other->stored && other->prefix.tokens.size() > parent_n &&
-                            other->prefix.tokens.size() < u->prefix.tokens.size() && extends(u->prefix, other->prefix)) {
-                            publication.parent = key; parent_n = other->prefix.tokens.size();
-                        }
-                  }
-                  for (const auto& part : u->parts) for (const auto& chunk : part.chunks)
-                      publication.refs.push_back(chunk->key);
-                  std::sort(publication.refs.begin(), publication.refs.end());
-                  publication.refs.erase(std::unique(publication.refs.begin(), publication.refs.end()), publication.refs.end());
-                  ok = storage->announce(publication, error);
-                  bool dead;
-                  { std::lock_guard lock(mutex); dead = u->dead; }
-                  if (ok && dead && storage->shared()) storage->dead(u->key);
+              if (ok && !job.payload_ready) {
+                  Bytes b;
+                  { std::lock_guard lock(mutex); b = manifest(*u); }
+                  ok = storage->put(u->key, b, error);
               }
             } catch (const std::exception&) { ok = false; }
             { std::lock_guard lock(mutex); u->pending = false; u->stored = ok; --active_jobs;
@@ -621,11 +622,6 @@ struct StateCache::Impl {
                 const auto key = it++->first; drop(key);
             } else ++it;
         }
-        for (auto it = chunks.begin(); it != chunks.end();) {
-            auto& bucket = it->second;
-            bucket.erase(std::remove_if(bucket.begin(), bucket.end(), [](const auto& w) { return w.expired(); }), bucket.end());
-            if (bucket.empty()) it = chunks.erase(it); else ++it;
-        }
         account();
         for (;;) {
             const bool ram = stats.ram_bytes > config.ram_bytes;
@@ -666,82 +662,10 @@ const Prefix& StateCache::Lease::prefix() const { if (!unit_) throw std::logic_e
 bool StateCache::publish(Capture capture, std::string& error) {
     error.clear();
     if (capture.prefix.tokens.empty() || capture.regions.empty()) { error = "state capture is incomplete"; return false; }
-    std::lock_guard lock(p_->mutex);
-    if (!p_->config.max_units) { ++p_->stats.rejected; return false; }
-    uint64_t capture_bytes = 0;
-    std::set<std::string> names;
-    for (const auto& region : capture.regions) {
-        if (region.name.empty() || !names.insert(region.name).second) { error = "duplicate or empty state region name"; return false; }
-        if (region.bytes.size() > p_->config.ram_bytes - capture_bytes) { ++p_->stats.rejected; return false; }
-        capture_bytes += region.bytes.size();
-    }
-    if (!capture_bytes) { error = "state capture has no payload"; return false; }
-    auto u = std::make_shared<Unit>(); u->prefix = std::move(capture.prefix);
-    u->anchor = capture.anchor; u->frontier = capture.frontier; u->sampling_ready = capture.sampling_ready;
-    u->min_prompt_tokens = capture.min_prompt_tokens;
-    u->stamp = p_->stats.watermark; u->used_at = p_->clock();
-    uint64_t total = 0;
-    for (auto& r : capture.regions) {
-        Part part; part.name = std::move(r.name);
-        for (size_t at = 0; at < r.bytes.size(); at += p_->config.chunk_bytes) {
-            const auto bytes = std::span<const uint8_t>(r.bytes).subspan(at, std::min(p_->config.chunk_bytes, r.bytes.size() - at));
-            const auto sum = hash(bytes);
-            const std::string content_key = "chunk-" + content_digest(bytes.data(), bytes.size());
-            std::shared_ptr<Chunk> c;
-            auto& bucket = p_->chunks[sum];
-            for (auto it = bucket.begin(); it != bucket.end();) {
-                auto existing = it->lock();
-                if (!existing) { it = bucket.erase(it); continue; }
-                if (existing->key == content_key && existing->size == bytes.size()) {
-                    c = std::move(existing);
-                    if (!c->data) c->data = std::make_shared<const Bytes>(bytes.begin(), bytes.end());
-                    break;
-                }
-                ++it;
-            }
-            if (!c) {
-                c = std::make_shared<Chunk>(); c->checksum = sum; c->size = bytes.size();
-                c->key = content_key;
-                c->data = std::make_shared<const Bytes>(bytes.begin(), bytes.end()); bucket.push_back(c);
-            }
-            total += c->size; part.chunks.push_back(std::move(c));
-        }
-        u->parts.push_back(std::move(part));
-    }
-    if (total > p_->config.ram_bytes || p_->config.max_units == 0) { ++p_->stats.rejected; return false; }
-    const Bytes m = p_->manifest(*u);
-    for (auto& [key, existing] : p_->units) {
-        (void) key;
-        if (!existing->dead && existing->prefix.identity == u->prefix.identity && existing->prefix.tokens == u->prefix.tokens &&
-            existing->prefix.extra == u->prefix.extra && p_->manifest(*existing) == m) {
-            existing->stamp = p_->stats.watermark; existing->used_at = p_->clock(); existing->ram = true;
-            if (p_->storage && !existing->stored && !existing->pending && p_->config.write_through &&
-                (p_->config.disk_bytes || p_->storage->shared())) {
-                existing->pending = true; p_->writes.emplace_back(existing); p_->cv.notify_one();
-            }
-            const std::string existing_key = key;
-            p_->trim();
-            const bool retained = p_->units.count(existing_key) != 0;
-            if (!retained) ++p_->stats.rejected;
-            return retained;
-        }
-    }
-    u->key = "unit-" + content_digest(m.data(), m.size()) + ".state";
-    const auto key = u->key;
-    p_->units.emplace(key, std::move(u));
-    p_->trim();
-    const auto found = p_->units.find(key);
-    if (found == p_->units.end() || p_->stats.ram_bytes > p_->config.ram_bytes) {
-        if (found != p_->units.end()) p_->drop(key);
-        ++p_->stats.rejected; p_->account(); return false;
-    }
-    ++p_->stats.admitted;
-    if (p_->storage && p_->config.write_through && (p_->config.disk_bytes || p_->storage->shared())) {
-        found->second->pending = true; p_->writes.push_back(found->second); p_->cv.notify_one();
-    }
-    p_->retire_frontiers(*found->second);
-    p_->trim();
-    return true;
+    std::vector<RegionSource> sources;
+    for (auto& region : capture.regions) sources.push_back(bytes_source(std::move(region.name), std::move(region.bytes)));
+    capture.regions.clear();
+    return publish(std::move(capture), sources, error);
 }
 
 bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sources, std::string& error) {
@@ -753,18 +677,37 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
     ++p_->stats.publishes;
     Elapsed elapsed{p_->stats.publish_seconds};
     if (!p_->config.max_units) { ++p_->stats.rejected; return false; }
+    auto unit = std::make_shared<Unit>();
+    unit->prefix = std::move(metadata.prefix); unit->anchor = metadata.anchor;
+    unit->frontier = metadata.frontier; unit->sampling_ready = metadata.sampling_ready;
+    unit->min_prompt_tokens = metadata.min_prompt_tokens;
+    unit->stamp = p_->stats.watermark; unit->used_at = p_->clock();
+    const std::string key = Impl::unit_key(*unit);
+    if (const auto existing = p_->units.find(key); existing != p_->units.end()) {   // this prefix is held: no copy
+        if (existing->second->dead) { ++p_->stats.rejected; return false; }
+        existing->second->stamp = p_->stats.watermark; existing->second->used_at = p_->clock();
+        if (p_->storage && existing->second->stored) p_->touch_later(key);
+        return true;
+    }
+    // The nearest saved ancestor: its append-only rows are this state's rows below its end.
+    const Unit* parent = nullptr;
+    for (const auto& [other_key, u] : p_->units) {
+        (void) other_key;
+        if (!u->dead && u->prefix.tokens.size() < unit->prefix.tokens.size() &&
+            (!parent || u->prefix.tokens.size() > parent->prefix.tokens.size()) && extends(unit->prefix, u->prefix))
+            parent = u.get();
+    }
     struct Read {
         std::shared_ptr<Chunk> chunk;
         size_t source;
         uint64_t offset;
         std::shared_ptr<const Bytes> captured;
     };
-    std::vector<Read> reads;
+    std::vector<Read> reads;                         // new chunks, copied once the state is admitted
+    std::vector<std::shared_ptr<Chunk>> members;     // every distinct chunk of the state
     std::vector<std::shared_ptr<Chunk>> reserved;
-    std::string key;
     bool complete = false;
-    // The cache lock keeps policy, shared backing and source admission coherent
-    // throughout this synchronous native capture. Storage never calls the cache.
+    std::string admitted_key;
     struct Cleanup {
         Impl& cache;
         std::vector<std::shared_ptr<Chunk>>& chunks;
@@ -778,226 +721,130 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
             for (const auto& c : chunks) c->reserved_ram = c->reserved_disk = false;
             try { cache.account(); } catch (...) { ++cache.stats.write_failures; }
         }
-    } cleanup{*p_, reserved, key, complete};
+    } cleanup{*p_, reserved, admitted_key, complete};
     try {
-        auto unit = std::make_shared<Unit>();
-        unit->prefix = std::move(metadata.prefix); unit->anchor = metadata.anchor;
-        unit->frontier = metadata.frontier; unit->sampling_ready = metadata.sampling_ready;
-        unit->min_prompt_tokens = metadata.min_prompt_tokens;
-        unit->stamp = p_->stats.watermark; unit->used_at = p_->clock();
+        const size_t step = p_->config.chunk_bytes;
         std::set<std::string> names;
-        std::set<Chunk*> seen;
+        std::set<const Chunk*> seen;
         uint64_t unique = 0;
-        bool capture_payload = p_->stats.ram_bytes <= p_->config.ram_bytes;
-        uint64_t headroom = capture_payload ? p_->config.ram_bytes - p_->stats.ram_bytes : 0;
-        for (const auto& source : sources) {
-            if (source.bytes > headroom) { capture_payload = false; break; }
-            headroom -= source.bytes;
-        }
-        if (capture_payload) for (const auto& [key, existing] : p_->units) {
-            (void) key;
-            if (existing->prefix.identity == unit->prefix.identity && existing->prefix.tokens == unit->prefix.tokens &&
-                existing->prefix.extra == unit->prefix.extra) {
-                capture_payload = false; break;
-            }
-        }
-        size_t hash_workers = 0;
-        if (capture_payload && p_->config.ram_bytes - p_->stats.ram_bytes - headroom >= (4ull << 20)) {
-            size_t chunks = 0;
-            for (const auto& source : sources) {
-                if (source.bytes) chunks += source.bytes > p_->config.chunk_bytes ? 2 : 1;
-                if (chunks >= 2) break;
-            }
-            if (chunks >= 2) hash_workers = std::min(16u, std::thread::hardware_concurrency());
-        }
-        const bool parallel_hash = hash_workers >= 2;
-        struct PreparedChunk {
-            std::shared_ptr<const Bytes> bytes;
-            uint64_t checksum;
-            std::string key;
-        };
-        std::vector<PreparedChunk> prepared;
-        if (parallel_hash) {
-            for (const auto& source : sources) {
-                if (source.name.empty() || !names.insert(source.name).second || !source.read) {
-                    error = "duplicate or invalid streaming state region"; return false;
-                }
-                for (uint64_t at = 0; at < source.bytes;) {
-                    const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
-                    auto bytes = std::make_shared<Bytes>(count);
-                    if (!source.read(at, bytes->data(), count, error)) return false;
-                    p_->stats.read_bytes += count;
-                    prepared.push_back({std::move(bytes), 0, {}}); at += count;
-                }
-            }
-            hash_workers = std::min(hash_workers, prepared.size());
-            std::vector<std::future<void>> jobs;
-            jobs.reserve(hash_workers);
-            for (size_t worker = 0; worker < hash_workers; ++worker) {
-                jobs.push_back(std::async(std::launch::async, [&prepared, worker, hash_workers] {
-                    for (size_t at = worker; at < prepared.size(); at += hash_workers) {
-                        auto& chunk = prepared[at];
-                        chunk.checksum = hash(*chunk.bytes);
-                        chunk.key = "chunk-" + content_digest(chunk.bytes->data(), chunk.bytes->size());
-                    }
-                }));
-            }
-            for (auto& job : jobs) job.get();
-        }
-        Bytes scratch(parallel_hash ? 0 : p_->config.chunk_bytes);
-        size_t prepared_at = 0;
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& source = sources[i];
-            if (!parallel_hash && (source.name.empty() || !names.insert(source.name).second || !source.read)) {
+            if (source.name.empty() || !names.insert(source.name).second || !source.read) {
                 error = "duplicate or invalid streaming state region"; return false;
             }
+            const Part* before = nullptr;
+            if (parent && source.rows)
+                for (const auto& part : parent->parts) if (part.name == source.name) before = &part;
+            std::vector<uint64_t> prints;
+            if (source.fingerprints && source.bytes) {
+                if (!source.fingerprints(step, prints, error)) return false;
+                if (prints.size() != (source.bytes + step - 1) / step) { error = "state fingerprint count mismatch"; return false; }
+            }
             Part part; part.name = source.name;
-            for (uint64_t at = 0; at < source.bytes;) {
-                const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
-                const auto* staged = parallel_hash ? &prepared[prepared_at++] : nullptr;
-                if (!staged && !source.read(at, scratch.data(), count, error)) return false;
-                if (!staged) p_->stats.read_bytes += count;
-                p_->stats.hashed_bytes += count;
-                const auto data = staged ? std::span<const uint8_t>(*staged->bytes) :
-                    std::span<const uint8_t>(scratch.data(), count);
-                const auto checksum = staged ? staged->checksum : hash(data);
-                const auto chunk_key = staged ? staged->key : "chunk-" + content_digest(data.data(), data.size());
+            for (uint64_t at = 0, k = 0; at < source.bytes; at += step, ++k) {
+                const size_t count = size_t(std::min<uint64_t>(step, source.bytes - at));
                 std::shared_ptr<Chunk> chunk;
-                auto& bucket = p_->chunks[checksum];
-                for (auto it = bucket.begin(); it != bucket.end();) {
-                    auto old = it->lock();
-                    if (!old) { it = bucket.erase(it); continue; }
-                    if (old->key == chunk_key && old->size == count) { chunk = std::move(old); break; }
-                    ++it;
+                std::shared_ptr<const Bytes> captured;
+                if (before && k < before->chunks.size() && count == step && before->chunks[k]->size == step &&
+                    before->chunks[k]->data) {
+                    const auto& old = before->chunks[k];
+                    bool same;
+                    if (!prints.empty()) same = p_->print_of(*old, *old->data) == prints[k];
+                    else {
+                        auto live = std::make_shared<Bytes>(count);
+                        if (!source.read(at, live->data(), count, error)) return false;
+                        p_->stats.read_bytes += count;
+                        same = std::memcmp(live->data(), old->data->data(), count) == 0;
+                        captured = std::move(live);
+                    }
+                    if (same) { chunk = old; p_->stats.reused_bytes += count; }
                 }
                 if (!chunk) {
-                    chunk = std::make_shared<Chunk>(); chunk->key = chunk_key;
-                    chunk->checksum = checksum; chunk->size = count; bucket.push_back(chunk);
-                }
-                if (seen.insert(chunk.get()).second) {
-                    if (count > UINT64_MAX-unique) { error = "state byte count overflow"; return false; }
-                    unique += count;
-                    std::shared_ptr<const Bytes> captured;
-                    if (capture_payload && !chunk->data) captured = staged ? staged->bytes :
-                        std::make_shared<const Bytes>(data.begin(), data.end());
+                    chunk = std::make_shared<Chunk>(); chunk->key = p_->chunk_name(); chunk->size = count;
+                    if (!prints.empty()) { chunk->print = prints[k]; chunk->printed = true; }
                     reads.push_back({chunk, i, at, std::move(captured)});
                 }
-                part.chunks.push_back(std::move(chunk)); at += count;
+                if (seen.insert(chunk.get()).second) {
+                    if (count > UINT64_MAX - unique) { error = "state byte count overflow"; return false; }
+                    unique += count; members.push_back(chunk);
+                }
+                part.chunks.push_back(std::move(chunk));
             }
             unit->parts.push_back(std::move(part));
         }
         if (!unique) { error = "state capture has no payload"; return false; }
         unit->ram = unique <= p_->config.ram_bytes;
-        if (!unit->ram && (!p_->storage || (!p_->config.disk_bytes && !p_->storage->shared()))) {
-            ++p_->stats.rejected; return false;
-        }
-        const auto manifest = p_->manifest(*unit);
-        const auto candidate = "unit-" + content_digest(manifest.data(), manifest.size()) + ".state";
-        if (const auto existing = p_->units.find(candidate); existing != p_->units.end()) {
-            if (existing->second->dead) { ++p_->stats.rejected; return false; }
-            existing->second->stamp = p_->stats.watermark; existing->second->used_at = p_->clock();
-            if (p_->storage && existing->second->stored) p_->control('T', candidate);
-            complete = true; return true;
-        }
-        for (const auto& read : reads) {
-            const auto& chunk = read.chunk;
+        if (!unit->ram && (!p_->storage || !p_->config.disk_bytes)) { ++p_->stats.rejected; return false; }
+        for (const auto& chunk : members) {
             chunk->reserved_ram = unit->ram && !chunk->data;
-            chunk->reserved_disk = !unit->ram && p_->storage->has_local_tier() &&
-                p_->storage->local_bytes(chunk->key, chunk->size) != chunk->size;
+            chunk->reserved_disk = !unit->ram && p_->storage->local_bytes(chunk->key, chunk->size) != chunk->size;
             reserved.push_back(chunk);
         }
-        unit->key = candidate; key = candidate;
-        p_->units.emplace(key, std::move(unit));
+        // Admission before any copy: the policy sees the bytes this state would add.
+        unit->key = key; admitted_key = key;
+        p_->units.emplace(key, std::move(unit));   // (no local reference: a pinned unit could not be evicted)
         p_->trim();
         const auto retained = p_->units.find(key);
-        if (retained == p_->units.end()) { ++p_->stats.rejected; key.clear(); return false; }
+        if (retained == p_->units.end()) { ++p_->stats.rejected; admitted_key.clear(); return false; }
         Unit& target = *retained->second;
-        target.pending = true;  // pin all members while their reserved bytes become real
-        for (const auto& read : reads) {
-            auto& chunk = *read.chunk;
-            const bool store = !target.ram && (!chunk.stored || p_->storage->shared() ||
-                (p_->storage->has_local_tier() && p_->storage->local_bytes(chunk.key, chunk.size) != chunk.size));
-            if ((!target.ram || chunk.data) && !store) continue;
-            std::shared_ptr<const Bytes> data = chunk.data;
-            if (!data) data = read.captured;
+        const auto fail = [&] { target.pending = false; return false; };
+        target.pending = true;   // pin every member while its reserved bytes become real
+        for (auto& read : reads) {
+            auto data = std::move(read.captured);
             if (!data) {
-                auto bytes = std::make_shared<Bytes>(size_t(chunk.size));
+                auto bytes = std::make_shared<Bytes>(size_t(read.chunk->size));
                 if (!sources[read.source].read(read.offset, bytes->data(), bytes->size(), error)) {
-                    ++p_->stats.rejected; target.pending = false; return false;
+                    ++p_->stats.rejected; return fail();
                 }
-                p_->stats.read_bytes += bytes->size(); p_->stats.hashed_bytes += bytes->size();
-                if (hash(*bytes) != chunk.checksum || "chunk-" + content_digest(bytes->data(), bytes->size()) != chunk.key) {
-                    error = "native state changed during capture"; ++p_->stats.rejected; target.pending = false; return false;
-                }
+                p_->stats.read_bytes += bytes->size();
                 data = std::move(bytes);
             }
-            if (target.ram) { chunk.data = std::move(data); chunk.reserved_ram = false; }
-            else {
-                if (!p_->storage->put(chunk.key, *data, error)) {
-                    ++p_->stats.write_failures; target.pending = false; return false;
-                }
-                chunk.stored = true; chunk.reserved_disk = false;
-            }
+            if (target.ram) { read.chunk->data = std::move(data); continue; }
+            p_->print_of(*read.chunk, *data);   // the state does not fit in RAM: its new bytes go to storage now
+            if (!p_->storage->put(read.chunk->key, *data, error)) { ++p_->stats.write_failures; return fail(); }
+            read.chunk->stored = true;
         }
-        target.pending = false;
         if (!target.ram) {
-            if (!p_->storage->put(key, manifest, error)) { ++p_->stats.write_failures; return false; }
+            for (const auto& chunk : members) {   // reused chunks only RAM held so far
+                if (chunk->stored && p_->storage->local_bytes(chunk->key, chunk->size) == chunk->size) continue;
+                p_->print_of(*chunk, *chunk->data);
+                if (!p_->storage->put(chunk->key, *chunk->data, error)) { ++p_->stats.write_failures; return fail(); }
+                chunk->stored = true;
+            }
+            if (!p_->storage->put(key, Impl::manifest(target), error)) { ++p_->stats.write_failures; return fail(); }
             target.stored = true;
         }
+        for (const auto& chunk : members) chunk->reserved_ram = chunk->reserved_disk = false;
+        target.pending = false;
         ++p_->stats.admitted;
-        if (p_->storage && (!target.ram || p_->config.write_through) &&
-            (p_->config.disk_bytes || p_->storage->shared())) {
-            target.pending = true;
-            Impl::Job job(retained->second); job.payload_ready = target.stored;
+        if (p_->storage && p_->config.disk_bytes && p_->config.write_through && !target.stored) {
+            target.pending = true;   // the queued write pins it until the worker finishes
+            Impl::Job job; job.unit = retained->second;
             p_->writes.push_back(std::move(job)); p_->cv.notify_one();
         }
         p_->retire_frontiers(target);
         complete = true; return true;
     } catch (const std::exception& e) {
-        if (!key.empty()) {
-            const auto found = p_->units.find(key);
-            if (found != p_->units.end()) found->second->pending = false;
-        }
         error = std::string("state capture failed: ") + e.what(); ++p_->stats.rejected; return false;
     }
 }
 
 StateCache::Lease StateCache::find_resume(const Prefix& prompt, bool need_sample) {
     std::lock_guard lock(p_->mutex);
-    if (p_->storage && p_->storage->shared()) {
-        try {
-            std::string error;
-            const auto candidates = p_->storage->lookup(prompt, error);
-            if (!error.empty()) ++p_->stats.read_failures;
-            p_->recover(&candidates);
-        } catch (const std::exception&) { ++p_->stats.read_failures; }
-    }
     Lease found;
     for (const auto& [key, u] : p_->units) {
         (void) key;
         if (u->dead || u->prefix.tokens.size() < found.tokens() || prompt.tokens.size() < u->min_prompt_tokens || !extends(prompt, u->prefix) ||
             (need_sample && u->prefix.tokens.size() == prompt.tokens.size() && !u->sampling_ready)) continue;
-        if (u->imported) {
-            std::string error;
-            if (!p_->storage->validate_unit(key, error)) {
-                u->dead = true; ++p_->stats.read_failures; continue;
-            }
-        }
         found.unit_ = u;
     }
-    if (found) { found.unit_->stamp = p_->stats.watermark; found.unit_->used_at = p_->clock(); ++found.unit_->uses;
-                 ++p_->stats.hits;
-                 bool ram = true, disk = bool(p_->storage);
-                 for (const auto& part : found.unit_->parts) for (const auto& chunk : part.chunks) {
-                     ram = ram && bool(chunk->data);
-                     disk = disk && p_->storage->local_bytes(chunk->key, chunk->size) == chunk->size;
-                 }
-                 if (ram) ++p_->stats.ram_hits;
-                 else if (disk) ++p_->stats.disk_hits;
-                 else ++p_->stats.remote_hits;
-                 if (p_->storage && found.unit_->stored) {
-                     p_->control('T', found.unit_->key);
-                 }
+    if (found) {
+        found.unit_->stamp = p_->stats.watermark; found.unit_->used_at = p_->clock(); ++found.unit_->uses;
+        ++p_->stats.hits;
+        bool ram = true;
+        for (const auto& part : found.unit_->parts) for (const auto& chunk : part.chunks) ram = ram && bool(chunk->data);
+        if (ram) ++p_->stats.ram_hits; else ++p_->stats.disk_hits;
+        if (p_->storage && found.unit_->stored) p_->touch_later(found.unit_->key);
     }
     else ++p_->stats.misses;
     p_->trim();
@@ -1022,17 +869,13 @@ bool StateCache::restore(const Lease& lease, std::vector<Region>& regions, std::
         for (const auto& c : part.chunks) {
             std::shared_ptr<const Bytes> bytes;
             { std::lock_guard lock(p_->mutex); bytes = c->data; }
-            Bytes disk;
             if (!bytes) {
                 const auto previous = fetched.find(c.get());
                 if (previous != fetched.end()) bytes = previous->second;
-                else if (!p_->storage || !p_->storage->get(c->key, disk, error) || disk.size() != c->size || hash(disk) != c->checksum ||
-                         c->key != "chunk-" + content_digest(disk.data(), disk.size())) {
+                else if (!(bytes = p_->load(*c, error))) {
                     std::lock_guard lock(p_->mutex); ++p_->stats.read_failures; lease.unit_->dead = true;
-                    if (error.empty()) error = "state object checksum or size mismatch";
                     return false;
-                }
-                if (!bytes) { bytes = std::make_shared<const Bytes>(std::move(disk)); fetched[c.get()] = bytes; }
+                } else fetched[c.get()] = bytes;
             }
             region.bytes.insert(region.bytes.end(), bytes->begin(), bytes->end());
         }
@@ -1109,30 +952,19 @@ bool StateCache::restore(const Lease& lease, const std::vector<RegionTarget>& ta
                 do { batch_bytes += chunks[end++]->size; }
                 while (end < chunks.size() && chunks[end]->size <= (4ull << 20) - std::min<uint64_t>(batch_bytes, 4ull << 20));
                 std::vector<std::shared_ptr<const Bytes>> data(end-begin);
-                std::vector<std::string> missing;
-                std::vector<size_t> indices;
+                bool loaded = false;
                 {
                     std::lock_guard lock(p_->mutex);
                     if (lease.unit_->dead) { error = "state invalidated during native load"; return false; }
-                    for (size_t i = begin; i < end; ++i) {
-                        data[i-begin] = chunks[i]->data;
-                        if (!data[i-begin]) { missing.push_back(chunks[i]->key); indices.push_back(i-begin); }
-                    }
+                    for (size_t i = begin; i < end; ++i) data[i-begin] = chunks[i]->data;
                 }
-                if (!missing.empty()) {
-                    std::vector<Bytes> fetched;
-                    bool ok = p_->storage && p_->storage->get_chunks(lease.unit_->key, missing, fetched, error) && fetched.size() == missing.size();
-                    for (size_t i = 0; ok && i < fetched.size(); ++i) {
-                        const auto& chunk = chunks[begin+indices[i]];
-                        ok = fetched[i].size() == chunk->size && hash(fetched[i]) == chunk->checksum &&
-                             "chunk-" + content_digest(fetched[i].data(), fetched[i].size()) == chunk->key;
-                    }
-                    if (!ok) {
+                for (size_t i = begin; i < end; ++i) {
+                    if (data[i-begin]) continue;
+                    if (!(data[i-begin] = p_->load(*chunks[i], error))) {
                         std::lock_guard lock(p_->mutex); ++p_->stats.read_failures; lease.unit_->dead = true;
-                        if (error.empty()) error = "incomplete or corrupt native recovery unit";
                         return false;
                     }
-                    for (size_t i = 0; i < fetched.size(); ++i) data[indices[i]] = std::make_shared<const Bytes>(std::move(fetched[i]));
+                    loaded = true;
                 }
                 for (const auto& bytes : data) {
                     if (!target.write(at, bytes->data(), bytes->size(), error)) return false;
@@ -1141,7 +973,7 @@ bool StateCache::restore(const Lease& lease, const std::vector<RegionTarget>& ta
                 // Small recovery units can return to RAM without retaining an
                 // extra full-unit buffer. Account each verified batch before the
                 // next read, and roll it back if active pins prevent admission.
-                if (cache_payload) {
+                if (cache_payload && loaded) {
                     std::lock_guard lock(p_->mutex);
                     if (lease.unit_->dead) { error = "state invalidated during native load"; return false; }
                     std::vector<Chunk*> fresh;
@@ -1189,16 +1021,7 @@ bool StateCache::read_region(const Lease& lease, const std::string& name, Bytes&
         for (const auto& chunk : found->chunks) {
             std::shared_ptr<const Bytes> data;
             { std::lock_guard lock(p_->mutex); data = chunk->data; }
-            if (!data) {
-                auto loaded = std::make_shared<Bytes>();
-                if (!p_->storage || !p_->storage->get_chunk(lease.unit_->key, chunk->key, *loaded, error) ||
-                    loaded->size() != chunk->size || hash(*loaded) != chunk->checksum ||
-                    "chunk-" + content_digest(loaded->data(), loaded->size()) != chunk->key) {
-                    if (error.empty()) error = "corrupt recovery sideband";
-                    return false;
-                }
-                data = std::move(loaded);
-            }
+            if (!data && !(data = p_->load(*chunk, error))) return false;
             result.insert(result.end(), data->begin(), data->end());
         }
         bytes = std::move(result); return true;
@@ -1224,12 +1047,7 @@ void StateCache::supersede(const Prefix& newest, size_t keep) {
         if (!u->anchor && u->prefix.tokens.size() < newest.tokens.size() && extends(newest, u->prefix)) ancestors.push_back(u.get());
     }
     std::sort(ancestors.begin(), ancestors.end(), [](const Unit* a, const Unit* b) { return a->prefix.tokens.size() > b->prefix.tokens.size(); });
-    for (size_t i = keep; i < ancestors.size(); ++i) if (p_->tier(*ancestors[i]) < 2) {
-        ancestors[i]->dead = true;
-        if (p_->storage && p_->storage->shared()) {
-            p_->control('D', ancestors[i]->key);
-        }
-    }
+    for (size_t i = keep; i < ancestors.size(); ++i) if (p_->tier(*ancestors[i]) < 2) ancestors[i]->dead = true;
     p_->trim();
 }
 void StateCache::flush() {
@@ -1240,12 +1058,7 @@ void StateCache::invalidate(const Prefix& failed) {
     std::lock_guard lock(p_->mutex);
     for (auto& [key, u] : p_->units) {
         (void) key;
-        if (extends(failed, u->prefix) || extends(u->prefix, failed)) {
-            u->dead = true;
-            if (p_->storage && p_->storage->shared()) {
-                p_->control('X', key);
-            }
-        }
+        if (extends(failed, u->prefix) || extends(u->prefix, failed)) u->dead = true;
     }
     p_->trim();
 }
@@ -1264,9 +1077,10 @@ std::string StateCache::report() const {
         << " calibration_samples=" << s.calibration_samples << " pending_writes=" << s.pending_writes
         << " pending_updates=" << s.pending_updates;
     out << " publishes=" << s.publishes << " publish_ms=" << s.publish_seconds * 1000 << " read_bytes=" << s.read_bytes
-        << " hashed_bytes=" << s.hashed_bytes << " restores=" << s.restores << " restore_ms=" << s.restore_seconds * 1000;
+        << " reused_bytes=" << s.reused_bytes << " hashed_bytes=" << s.hashed_bytes << " restores=" << s.restores
+        << " restore_ms=" << s.restore_seconds * 1000;
     out << " unique_bytes=" << s.unique_bytes << " shared_bytes=" << s.shared_bytes << " pinned_units=" << s.pinned_units
-        << " ram_hits=" << s.ram_hits << " disk_hits=" << s.disk_hits << " remote_hits=" << s.remote_hits;
+        << " ram_hits=" << s.ram_hits << " disk_hits=" << s.disk_hits;
     return out.str();
     } catch (const std::bad_alloc&) { return {}; }
 }

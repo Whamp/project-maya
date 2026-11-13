@@ -8383,7 +8383,7 @@ bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
             m->kv_ ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_, m->dsa_ig_, m->dsa_pool_, n, m->kv_, true);
         memory.clear();
         for (size_t i = 0; i < runs.size(); ++i)
-            memory.push_back({base+"attention-"+std::to_string(i), {{runs[i].first, size_t(runs[i].second)*sizeof(float)}}});
+            memory.push_back({base+"attention-"+std::to_string(i), {{runs[i].first, size_t(runs[i].second)*sizeof(float)}}, true});
         if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(dev_); return false; }
     }
     cudaSetDevice(dev_);

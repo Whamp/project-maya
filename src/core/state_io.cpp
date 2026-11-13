@@ -126,9 +126,26 @@ bool memory_sources(const std::vector<MemoryRegion>& memory, int device,
     for (const auto& region : memory) {
         size_t bytes;
         if (!size_of(region, bytes)) { error = "invalid native capture view"; return false; }
-        out.push_back({region.name, bytes, [region, device, transfer](uint64_t at, uint8_t* dst, size_t n, std::string& e) {
+        RegionSource source;
+        source.name = region.name; source.bytes = bytes; source.rows = region.rows;
+        source.read = [region, device, transfer](uint64_t at, uint8_t* dst, size_t n, std::string& e) {
             return transfer->copy(region, device, at, dst, n, false, e);
-        }});
+        };
+        cudaPointerAttributes where{};
+        if (region.rows && region.segments.size() == 1 && bytes &&
+            cudaPointerGetAttributes(&where, region.segments[0].address) == cudaSuccess && where.type == cudaMemoryTypeDevice) {
+            const void* address = region.segments[0].address;
+            source.fingerprints = [address, bytes, device](size_t chunk, std::vector<uint64_t>& prints, std::string& e) {
+                int before = 0;
+                if (cudaGetDevice(&before) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) {
+                    e = "state fingerprint device unavailable"; return false;
+                }
+                const bool ok = device_fingerprints(address, bytes, chunk, prints, e);
+                cudaSetDevice(before);
+                return ok;
+            };
+        } else cudaGetLastError();   // (a host pointer is not an error worth keeping)
+        out.push_back(std::move(source));
     }
     return true;
 }

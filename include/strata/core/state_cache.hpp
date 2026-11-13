@@ -12,6 +12,9 @@ namespace strata::core::statecache {
 
 using Bytes = std::vector<uint8_t>;
 std::string content_digest(const void* data, size_t bytes);
+// Detects accidental change of a byte range (not a cryptographic hash): the sum, mod 2^64, of a mixed value per
+// 8-byte word and its index. state_io computes the same value on the GPU.
+uint64_t fingerprint(const void* data, size_t bytes);
 
 struct ExtraInput {
     uint64_t position = 0, length = 0;
@@ -49,6 +52,12 @@ struct RegionSource {
     std::string name;
     uint64_t bytes = 0;
     std::function<bool(uint64_t, uint8_t*, size_t, std::string&)> read;
+    // Append-only rows: the bytes a shorter prefix holds never change as the sequence grows. A new state reuses
+    // its parent's chunks for them once they are checked to match the live bytes.
+    bool rows = false;
+    // Optional: the fingerprint of each `chunk`-byte piece of the whole region, computed where its bytes live.
+    // Without it, a reuse check reads the live bytes and compares them.
+    std::function<bool(size_t chunk, std::vector<uint64_t>&, std::string&)> fingerprints;
 };
 struct RegionTarget {
     std::string name;
@@ -87,61 +96,26 @@ struct Stats {
     uint64_t pending_writes = 0;
     uint64_t pending_updates = 0;
     uint64_t unique_bytes = 0, shared_bytes = 0, pinned_units = 0;
-    uint64_t ram_hits = 0, disk_hits = 0, remote_hits = 0;
-    uint64_t publishes = 0, read_bytes = 0, hashed_bytes = 0, restores = 0;
+    uint64_t ram_hits = 0, disk_hits = 0;
+    uint64_t publishes = 0, read_bytes = 0, reused_bytes = 0, hashed_bytes = 0, restores = 0;
     double publish_seconds = 0, restore_seconds = 0;
 };
 
 class Storage {
 public:
-    struct Publication {
-        std::string key, parent;
-        Prefix prefix;
-        std::vector<std::string> refs;
-        double value = 0;
-        bool frontier = false;
-    };
     virtual ~Storage() = default;
     virtual bool put(const std::string& key, const Bytes& data, std::string& error) = 0;
     virtual bool get(const std::string& key, Bytes& data, std::string& error) = 0;
-    virtual bool get_chunk(const std::string&, const std::string& key, Bytes& data, std::string& error) {
-        return get(key, data, error);
-    }
-    // Caller bounds the aggregate payload; each object remains independently verified.
-    virtual bool get_chunks(const std::string& unit, const std::vector<std::string>& keys,
-                            std::vector<Bytes>& data, std::string& error) {
-        data.clear();
-        for (const auto& key : keys) {
-            Bytes bytes;
-            if (!get_chunk(unit, key, bytes, error)) { data.clear(); return false; }
-            data.push_back(std::move(bytes));
-        }
-        return true;
-    }
     virtual bool erase(const std::string& key, std::string& error) = 0;
     virtual std::vector<std::string> manifests(std::string& error) = 0;
-    // Local stores may remove objects left behind by interrupted publication.
-    // Shared stores implement reclamation through their own leases/unit metadata.
+    // Removes objects left behind by an interrupted publication.
     virtual void prune(const std::vector<std::string>&, std::string&) {}
-    virtual std::vector<std::string> lookup(const Prefix&, std::string&) { return {}; }
-    virtual bool announce(const Publication&, std::string&) { return true; }
     virtual void touch(const std::string&) {}
-    virtual void dead(const std::string&) {}
-    virtual void invalidate(const std::string& key) { dead(key); }
-    virtual bool shared() const { return false; }
-    // Imported units retain the shared manifest as their recovery authority,
-    // even after every payload chunk has been promoted into local RAM.
-    virtual bool validate_unit(const std::string& key, std::string& error) {
-        Bytes manifest;
-        return get(key, manifest, error);
-    }
     virtual uint64_t local_bytes(const std::string&, uint64_t expected) const { return expected; }
     virtual double age_seconds(const std::string&) const { return 0; }
-    virtual bool has_local_tier() const { return true; }
 };
 
 std::shared_ptr<Storage> file_storage(const std::string& directory);
-std::shared_ptr<Storage> mooncake_storage(std::shared_ptr<Storage> local = {});
 
 class StateCache {
     struct Unit;

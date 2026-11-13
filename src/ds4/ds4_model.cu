@@ -9903,8 +9903,8 @@ struct Model::Impl {
     using StateMemory = std::map<int, std::vector<core::statecache::MemoryRegion>>;
     StateMemory state_memory(int64_t n, const Check* checkpoint, bool loading) {
         StateMemory memory;
-        const auto add = [&](int device, std::string name, void* ptr, size_t bytes) {
-            memory[device].push_back({std::move(name), {{ptr, bytes}}});
+        const auto add = [&](int device, std::string name, void* ptr, size_t bytes, bool rows = false) {
+            memory[device].push_back({std::move(name), {{ptr, bytes}}, rows});
         };
         for (size_t i = 0; i < L.size(); ++i) {
             for (int m = 0; m < (loading ? L[i].nm : 1); ++m) {
@@ -9933,9 +9933,9 @@ struct Model::Impl {
                 if (source.ik[di]) { index_owner = di; break; }
             for (size_t di = 0; di < devs.size(); ++di) {
                 if ((loading || di == kv_owner) && source.ckv[di])
-                    add(int(di), "source-" + std::to_string(i) + "/kv", source.ckv[di], rows * ckv_rb());
+                    add(int(di), "source-" + std::to_string(i) + "/kv", source.ckv[di], rows * ckv_rb(), true);
                 if ((loading || di == index_owner) && source.ik[di])
-                    add(int(di), "source-" + std::to_string(i) + "/index", source.ik[di], rows * ik_rb());
+                    add(int(di), "source-" + std::to_string(i) + "/index", source.ik[di], rows * ik_rb(), true);
             }
         }
         return memory;

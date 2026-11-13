@@ -602,7 +602,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # already links `strata_core` - putting `gdn_layer` in core would make the two mutually dependent.  A third
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
-  add_library(strata_gpu_state STATIC src/core/state_io.cpp)
+  add_library(strata_gpu_state STATIC src/core/state_io.cpp src/core/state_fingerprint.cu)
   target_include_directories(strata_gpu_state PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_gpu_state PUBLIC strata_state_cache ${_strata_gpu_runtime_target})
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/session_state_cache.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
