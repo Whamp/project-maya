@@ -10,6 +10,7 @@
 #include <map>
 #include <stdexcept>
 #include <cstring>
+#include <thread>
 
 namespace sc = strata::core::statecache;
 using sc::Bytes;
@@ -137,7 +138,8 @@ int main() {
             auto c = config(); c.directory = dir.string();
             {
                 sc::StateCache cache(c);
-                check(cache.publish(capture(prefix({4, 5}), {8, 7, 6, 5, 4, 3, 2, 1}), error), "publish persistent state");
+                sc::Capture metadata; metadata.prefix = prefix({4,5});
+                check(cache.publish(metadata, {sc::bytes_source("kv", {8,7,6,5,4,3,2,1})}, error), "publish persistent streamed state");
                 cache.flush();
                 check(cache.stats().disk_bytes == 8 && cache.stats().write_failures == 0, "write-through finished");
                 bool locked = false;
@@ -181,7 +183,8 @@ int main() {
         {
             auto storage = std::make_shared<FailingStorage>();
             sc::StateCache cache(config(), storage);
-            check(cache.publish(capture(prefix({7}), {1, 2, 3, 4}), error), "RAM admission before asynchronous storage failure");
+            sc::Capture metadata; metadata.prefix = prefix({7});
+            check(cache.publish(metadata, {sc::bytes_source("kv", {1,2,3,4})}, error), "streamed RAM admission before asynchronous storage failure");
             cache.flush();
             check(storage->writes > 0 && cache.stats().write_failures > 0, "worker reports exceptions and completes its job");
             auto lease = cache.find_resume(prefix({7, 8}));
@@ -251,13 +254,220 @@ int main() {
             cache.release(lease);
         }
         {
+            auto c = config(); c.chunk_bytes = 64 << 10;
+            Bytes kv(64*c.chunk_bytes+17, 201), aux(2*c.chunk_bytes+9, 202);
+            for (size_t chunk = 0; chunk < 64; ++chunk)
+                std::fill_n(kv.data()+chunk*c.chunk_bytes, c.chunk_bytes, uint8_t(chunk+1));
+            std::fill_n(aux.data(), c.chunk_bytes, uint8_t(1));
+            std::fill_n(aux.data()+c.chunk_bytes, c.chunk_bytes, uint8_t(101));
+            c.ram_bytes = c.chunk_bytes+kv.size()+aux.size();
+            sc::StateCache cache(c);
+            check(cache.publish(capture(prefix({9}), Bytes(c.chunk_bytes, 1)), error), "seed shared large capture chunk");
+            const auto caller = std::this_thread::get_id();
+            size_t source_bytes = 0;
+            const std::vector<sc::RegionSource> sources{
+                {"kv", kv.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                    check(std::this_thread::get_id() == caller, "large kv source stays on the publishing thread");
+                    check(source_bytes == at && at < kv.size() && n == std::min(c.chunk_bytes, kv.size()-size_t(at)),
+                          "large kv reads keep ordered 64 KiB ranges and the partial tail");
+                    source_bytes += n; std::memcpy(out, kv.data()+at, n); return true;
+                }},
+                {"aux", aux.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                    check(std::this_thread::get_id() == caller, "large auxiliary source stays on the publishing thread");
+                    check(source_bytes == kv.size()+at && at < aux.size() &&
+                          n == std::min(c.chunk_bytes, aux.size()-size_t(at)),
+                          "large auxiliary reads follow kv in ordered 64 KiB ranges with a partial tail");
+                    source_bytes += n; std::memcpy(out, aux.data()+at, n); return true;
+                }}
+            };
+            sc::Capture metadata; metadata.prefix = prefix({1,2}); metadata.prefix.extra = {{0,1,"large-image"}};
+            metadata.sampling_ready = true; metadata.anchor = true; metadata.frontier = true; metadata.min_prompt_tokens = 4;
+            check(cache.publish(metadata, sources, error) && source_bytes == kv.size()+aux.size(),
+                  "large streamed capture reads each multi-region byte once with repeated and partial chunks");
+            const auto stats = cache.stats();
+            check(stats.units == 2 && stats.admitted == 2 && stats.logical_bytes == 67*c.chunk_bytes+26 &&
+                  stats.unique_bytes == 65*c.chunk_bytes+26 && stats.shared_bytes == 2*c.chunk_bytes &&
+                  stats.ram_bytes == stats.unique_bytes,
+                  "large streamed capture accounts shared RAM and partial chunks exactly");
+            auto owned = metadata; owned.regions = {{"kv", kv}, {"aux", aux}};
+            check(cache.publish(std::move(owned), error) && cache.stats().units == 2 && cache.stats().admitted == 2,
+                  "large streamed and owned captures have identical chunk and metadata manifests");
+            auto prompt = metadata.prefix; prompt.tokens.push_back(3);
+            check(!cache.find_resume(prompt), "large capture preserves minimum prompt length");
+            prompt.tokens.push_back(4);
+            auto lease = cache.find_resume(prompt);
+            std::vector<sc::Region> out;
+            check(lease && lease.sampling_ready() && cache.restore(lease, out, error) && out.size() == 2 &&
+                  out[0].name == "kv" && out[0].bytes == kv && out[1].name == "aux" && out[1].bytes == aux,
+                  "large capture restores exact region bytes and sampling metadata");
+            cache.release(lease);
+        }
+        {
+            auto c = config(); c.chunk_bytes = 64 << 10; c.ram_bytes = 5ull << 20;
+            sc::StateCache cache(c);
+            check(cache.publish(capture(prefix({9}), Bytes(c.chunk_bytes, 9)), error), "seed large capture rollback");
+            const auto before = cache.stats();
+            const auto caller = std::this_thread::get_id();
+            size_t reads = 0;
+            const std::vector<sc::RegionSource> sources{{"kv", (4ull << 20)+3,
+                [&](uint64_t, uint8_t* out, size_t n, std::string& e) {
+                    check(std::this_thread::get_id() == caller, "failing large source stays on the publishing thread");
+                    if (++reads == 3) { e = "injected large first-pass failure"; return false; }
+                    std::fill_n(out, n, uint8_t(1)); return true;
+                }}};
+            sc::Capture metadata; metadata.prefix = prefix({1,2});
+            check(!cache.publish(metadata, sources, error) && reads == 3 && error == "injected large first-pass failure",
+                  "large capture reports source failure after previously staged chunks");
+            const auto after = cache.stats();
+            check(after.units == before.units && after.admitted == before.admitted && after.ram_bytes == before.ram_bytes &&
+                  after.logical_bytes == before.logical_bytes && !cache.find_resume(prefix({1,2,3})),
+                  "failed large capture leaves existing units and RAM accounting intact");
+            auto lease = cache.find_resume(prefix({9,10}));
+            std::vector<sc::Region> out;
+            check(lease && cache.restore(lease, out, error) && out[0].bytes == Bytes(c.chunk_bytes, 9),
+                  "failed large capture preserves existing bytes");
+            cache.release(lease);
+        }
+        {
+            auto c = config(); c.ram_bytes = 16;
+            sc::StateCache cache(c);
+            const Bytes kv{1,2,3,4,1,2,3,4,9,8}, aux{5,6,7,8,9,8};
+            size_t source_bytes = 0;
+            std::vector<sc::RegionSource> sources;
+            sources.push_back({"kv", kv.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                source_bytes += n; std::memcpy(out, kv.data()+at, n); return true;
+            }});
+            sources.push_back({"aux", aux.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                source_bytes += n; std::memcpy(out, aux.data()+at, n); return true;
+            }});
+            sc::Capture metadata; metadata.prefix = prefix({1,2}); metadata.sampling_ready = true;
+            metadata.anchor = true; metadata.frontier = true; metadata.min_prompt_tokens = 4;
+            check(cache.publish(metadata, sources, error) && source_bytes == 16,
+                  "fitting streaming capture reads each region byte once, including repeated and partial chunks");
+            const auto stats = cache.stats();
+            check(stats.units == 1 && stats.logical_bytes == 16 && stats.unique_bytes == 10 &&
+                  stats.shared_bytes == 6 && stats.ram_bytes == 10 && stats.admitted == 1,
+                  "single-pass capture preserves logical and shared payload accounting");
+            check(cache.publish(metadata, sources, error) && source_bytes == 32 && cache.stats().admitted == 1,
+                  "duplicate streamed manifest reads once and keeps one admission");
+            auto owned = metadata; owned.regions = {{"kv", kv}, {"aux", aux}};
+            check(cache.publish(std::move(owned), error) && cache.stats().units == 1 && cache.stats().admitted == 1,
+                  "streamed chunks and metadata produce the same manifest identity as owned capture");
+            check(!cache.find_resume(prefix({1,2,3})), "streamed metadata preserves minimum prompt length");
+            auto lease = cache.find_resume(prefix({1,2,3,4}));
+            std::vector<sc::Region> out;
+            check(lease && lease.sampling_ready() && cache.restore(lease, out, error) && out.size() == 2 &&
+                  out[0].name == "kv" && out[0].bytes == kv && out[1].name == "aux" && out[1].bytes == aux,
+                  "single-pass capture restores exact multi-region bytes and sampling metadata");
+            cache.invalidate(metadata.prefix);
+            check(!cache.restore(lease, out, error) && !cache.find_resume(prefix({1,2,3,4})),
+                  "captured bytes do not make an invalidated unit usable");
+            check(!cache.publish(metadata, sources, error), "captured duplicate cannot revive an invalidated pinned unit");
+            cache.release(lease);
+            check(cache.stats().units == 0 && cache.stats().ram_bytes == 0, "invalidated captured bytes are reclaimed");
+        }
+        {
+            sc::StateCache cache(config());
+            sc::Capture metadata; metadata.prefix = prefix({1,2});
+            metadata.prefix.extra = {{0,1,"image-a"}};
+            check(cache.publish(capture(metadata.prefix, {9,9,9,9}), error), "seed matching prefix with different native bytes");
+            const Bytes native{1,2,3,4,5,6,7,8};
+            size_t source_bytes = 0;
+            const std::vector<sc::RegionSource> sources{{"kv", native.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                source_bytes += n; std::memcpy(out, native.data()+at, n); return true;
+            }}};
+            metadata.sampling_ready = true;
+            check(cache.publish(metadata, sources, error) && source_bytes == 2*native.size() &&
+                  cache.stats().units == 2 && cache.stats().admitted == 2,
+                  "matching prefix uses the reread path and still admits different native bytes");
+            auto owned = metadata; owned.regions = {{"kv", native}};
+            check(cache.publish(std::move(owned), error) && cache.stats().units == 2 && cache.stats().admitted == 2,
+                  "matching-prefix streamed capture has the same manifest identity as owned capture");
+            auto lease = cache.find_resume(metadata.prefix);
+            std::vector<sc::Region> out;
+            check(lease && lease.sampling_ready() && cache.restore(lease, out, error) && out.size() == 1 && out[0].bytes == native,
+                  "matching prefix does not substitute old bytes for the new sampling-ready unit");
+            cache.release(lease);
+        }
+        for (const uint64_t budget : {uint64_t(12), uint64_t(11)}) {
+            auto c = config(); c.ram_bytes = budget;
+            sc::StateCache cache(c);
+            check(cache.publish(capture(prefix({9}), {9,9,9,9}), error), "seed RAM headroom boundary");
+            const Bytes native{1,2,3,4,5,6,7,8};
+            size_t source_bytes = 0;
+            sc::RegionSource source{"kv", native.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                source_bytes += n; std::memcpy(out, native.data()+at, n); return true;
+            }};
+            sc::Capture metadata; metadata.prefix = prefix({1,2,3});
+            check(cache.publish(metadata, {source}, error), "headroom boundary admits under existing trim policy");
+            check(source_bytes == (budget == 12 ? 8 : 16),
+                  "exact free-space fit captures once and one byte less headroom uses the reread fallback");
+            auto lease = cache.find_resume(prefix({1,2,3,4}));
+            std::vector<sc::Region> out;
+            check(lease && cache.restore(lease, out, error) && out[0].bytes == native && cache.stats().ram_bytes <= budget,
+                  "both headroom paths restore exact bytes within the retained RAM budget");
+            cache.release(lease);
+        }
+        for (const bool copy_failure : {false, true}) {
+            auto c = config(); c.ram_bytes = 11;
+            sc::StateCache cache(c);
+            check(cache.publish(capture(prefix({9}), {9,9,9,9}), error), "seed fallback rollback headroom");
+            size_t reads = 0;
+            sc::RegionSource source{"kv", 8, [&](uint64_t at, uint8_t* out, size_t n, std::string& e) {
+                ++reads;
+                if (reads == 3 && copy_failure) { e = "injected native copy failure"; return false; }
+                for (size_t i = 0; i < n; ++i) out[i] = uint8_t(at+i+(reads > 2 ? 1 : 0));
+                return true;
+            }};
+            sc::Capture metadata; metadata.prefix = prefix({1,2,3});
+            check(!cache.publish(metadata, {source}, error) && reads == 3,
+                  "insufficient headroom retains second-pass copy failure and mutation rejection");
+            check(!cache.find_resume(prefix({1,2,3,4})) && cache.stats().units == 0 && cache.stats().ram_bytes == 0,
+                  "failed fallback removes incomplete unit and reservations after policy eviction");
+        }
+        {
+            auto c = config(); c.max_units = 2; c.leaf_last = true;
+            sc::StateCache cache(c);
+            check(cache.publish(capture(prefix({1}), {1,2,3,4}), error), "seed shared captured chunk");
+            auto pinned = cache.find_resume(prefix({1,9}));
+            check(cache.publish(capture(prefix({8}), {8,8,8,8}), error), "seed eviction candidate");
+            const Bytes native{1,2,3,4,5,6,7,8};
+            size_t source_bytes = 0;
+            sc::RegionSource source{"kv", native.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
+                source_bytes += n; std::memcpy(out, native.data()+at, n); return true;
+            }};
+            sc::Capture metadata; metadata.prefix = prefix({8,9,10});
+            check(cache.publish(metadata, {source}, error) && source_bytes == 8 && cache.stats().units == 2,
+                  "capture shares existing RAM backing while count trimming respects a pinned unit");
+            std::vector<sc::Region> out;
+            auto lease = cache.find_resume(prefix({8,9,10,11}));
+            check(lease && cache.restore(lease, out, error) && out[0].bytes == native,
+                  "trimmed capture retains both shared and newly captured chunks");
+            check(cache.restore(pinned, out, error) && out[0].bytes == Bytes({1,2,3,4}), "pinned shared source remains intact");
+            cache.release(lease); cache.release(pinned);
+        }
+        {
+            sc::StateCache cache(config());
+            size_t reads = 0;
+            const auto fail = [&](uint64_t, uint8_t*, size_t, std::string& e) {
+                ++reads; e = "injected first-pass failure"; return false;
+            };
+            sc::Capture metadata; metadata.prefix = prefix({1,2});
+            const std::vector<sc::RegionSource> sources{{"huge", UINT64_MAX, fail}, {"overflow", 1, fail}};
+            check(!cache.publish(metadata, sources, error) &&
+                  reads == 1 && error == "injected first-pass failure" && cache.stats().units == 0,
+                  "overflowing logical source sizes fall back to normal source validation without early rejection");
+        }
+        {
             const auto dir = std::filesystem::temp_directory_path() /
                 ("maya-state-stream-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
             auto c = config(); c.directory = dir.string(); c.ram_bytes = 8; c.disk_bytes = 128;
+            size_t source_bytes = 0;
             Bytes native(64);
             for (size_t i = 0; i < native.size(); ++i) native[i] = uint8_t(i);
             sc::RegionSource source{"kv", native.size(), [&](uint64_t at, uint8_t* out, size_t n, std::string&) {
                 check(n <= c.chunk_bytes && at+n <= native.size(), "capture staging remains bounded");
+                source_bytes += n;
                 std::memcpy(out, native.data()+at, n); return true;
             }};
             {
@@ -265,7 +475,19 @@ int main() {
                 sc::Capture metadata; metadata.prefix = prefix({1,2});
                 check(cache.publish(std::move(metadata), {source}, error), "capture larger than RAM directly into SSD");
                 cache.flush();
+                check(source_bytes == 2*native.size(), "oversized disk capture retains bounded two-pass reads");
                 check(cache.stats().ram_bytes == 0 && cache.stats().disk_bytes == native.size(), "large state never materializes in RAM tier");
+            }
+            {
+                auto roomy = c; roomy.ram_bytes = native.size();
+                sc::StateCache cache(roomy);
+                const auto before = source_bytes;
+                sc::Capture metadata; metadata.prefix = prefix({1,2});
+                check(cache.publish(metadata, {source}, error) && source_bytes-before == native.size(),
+                      "disk-only duplicate still reads every source occurrence with newly available RAM headroom");
+                cache.flush();
+                check(cache.stats().admitted == 0 && cache.stats().units == 1 && cache.stats().ram_bytes == 0 &&
+                      cache.stats().disk_bytes == native.size(), "duplicate refresh does not promote captured disk-only bytes");
             }
             {
                 auto storage = std::make_shared<BatchStorage>(sc::file_storage(dir.string()));
@@ -317,7 +539,8 @@ int main() {
             auto storage = std::make_shared<SharedObjects>();
             sc::StateCache producer(c, storage), consumer(c, storage);
             const auto state = capture(prefix({1,2}), {1,2,3,4});
-            check(producer.publish(state, error), "shared producer capture"); producer.flush();
+            sc::Capture metadata; metadata.prefix = state.prefix;
+            check(producer.publish(metadata, {sc::bytes_source("kv", state.regions[0].bytes)}, error), "shared streamed producer capture"); producer.flush();
             auto lease = consumer.find_resume(prefix({1,2,3}));
             std::vector<sc::Region> out;
             check(lease && consumer.restore(lease, out, error) && out[0].bytes == Bytes({1,2,3,4}), "consumer imports shared bytes");

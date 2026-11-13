@@ -10,6 +10,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -749,6 +750,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         std::shared_ptr<Chunk> chunk;
         size_t source;
         uint64_t offset;
+        std::shared_ptr<const Bytes> captured;
     };
     std::vector<Read> reads;
     std::vector<std::shared_ptr<Chunk>> reserved;
@@ -779,22 +781,77 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         std::set<std::string> names;
         std::set<Chunk*> seen;
         uint64_t unique = 0;
-        Bytes scratch(p_->config.chunk_bytes);
-        // First pass gathers exact identities and physical sharing without
-        // allocating a host copy of the conversation. Its native owner is held
-        // by the caller until the final missing-chunk copy completes.
+        bool capture_payload = p_->stats.ram_bytes <= p_->config.ram_bytes;
+        uint64_t headroom = capture_payload ? p_->config.ram_bytes - p_->stats.ram_bytes : 0;
+        for (const auto& source : sources) {
+            if (source.bytes > headroom) { capture_payload = false; break; }
+            headroom -= source.bytes;
+        }
+        if (capture_payload) for (const auto& [key, existing] : p_->units) {
+            (void) key;
+            if (existing->prefix.identity == unit->prefix.identity && existing->prefix.tokens == unit->prefix.tokens &&
+                existing->prefix.extra == unit->prefix.extra) {
+                capture_payload = false; break;
+            }
+        }
+        size_t hash_workers = 0;
+        if (capture_payload && p_->config.ram_bytes - p_->stats.ram_bytes - headroom >= (4ull << 20)) {
+            size_t chunks = 0;
+            for (const auto& source : sources) {
+                if (source.bytes) chunks += source.bytes > p_->config.chunk_bytes ? 2 : 1;
+                if (chunks >= 2) break;
+            }
+            if (chunks >= 2) hash_workers = std::min(16u, std::thread::hardware_concurrency());
+        }
+        const bool parallel_hash = hash_workers >= 2;
+        struct PreparedChunk {
+            std::shared_ptr<const Bytes> bytes;
+            uint64_t checksum;
+            std::string key;
+        };
+        std::vector<PreparedChunk> prepared;
+        if (parallel_hash) {
+            for (const auto& source : sources) {
+                if (source.name.empty() || !names.insert(source.name).second || !source.read) {
+                    error = "duplicate or invalid streaming state region"; return false;
+                }
+                for (uint64_t at = 0; at < source.bytes;) {
+                    const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
+                    auto bytes = std::make_shared<Bytes>(count);
+                    if (!source.read(at, bytes->data(), count, error)) return false;
+                    prepared.push_back({std::move(bytes), 0, {}}); at += count;
+                }
+            }
+            hash_workers = std::min(hash_workers, prepared.size());
+            std::vector<std::future<void>> jobs;
+            jobs.reserve(hash_workers);
+            for (size_t worker = 0; worker < hash_workers; ++worker) {
+                jobs.push_back(std::async(std::launch::async, [&prepared, worker, hash_workers] {
+                    for (size_t at = worker; at < prepared.size(); at += hash_workers) {
+                        auto& chunk = prepared[at];
+                        chunk.checksum = hash(*chunk.bytes);
+                        chunk.key = "chunk-" + content_digest(chunk.bytes->data(), chunk.bytes->size());
+                    }
+                }));
+            }
+            for (auto& job : jobs) job.get();
+        }
+        Bytes scratch(parallel_hash ? 0 : p_->config.chunk_bytes);
+        size_t prepared_at = 0;
         for (size_t i = 0; i < sources.size(); ++i) {
             const auto& source = sources[i];
-            if (source.name.empty() || !names.insert(source.name).second || !source.read) {
+            if (!parallel_hash && (source.name.empty() || !names.insert(source.name).second || !source.read)) {
                 error = "duplicate or invalid streaming state region"; return false;
             }
             Part part; part.name = source.name;
             for (uint64_t at = 0; at < source.bytes;) {
-                const size_t count = size_t(std::min<uint64_t>(scratch.size(), source.bytes-at));
-                if (!source.read(at, scratch.data(), count, error)) return false;
-                const auto data = std::span<const uint8_t>(scratch.data(), count);
-                const auto checksum = hash(data);
-                const auto chunk_key = "chunk-" + content_digest(data.data(), data.size());
+                const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
+                const auto* staged = parallel_hash ? &prepared[prepared_at++] : nullptr;
+                if (!staged && !source.read(at, scratch.data(), count, error)) return false;
+                const auto data = staged ? std::span<const uint8_t>(*staged->bytes) :
+                    std::span<const uint8_t>(scratch.data(), count);
+                const auto checksum = staged ? staged->checksum : hash(data);
+                const auto chunk_key = staged ? staged->key : "chunk-" + content_digest(data.data(), data.size());
                 std::shared_ptr<Chunk> chunk;
                 auto& bucket = p_->chunks[checksum];
                 for (auto it = bucket.begin(); it != bucket.end();) {
@@ -809,7 +866,11 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                 }
                 if (seen.insert(chunk.get()).second) {
                     if (count > UINT64_MAX-unique) { error = "state byte count overflow"; return false; }
-                    unique += count; reads.push_back({chunk, i, at});
+                    unique += count;
+                    std::shared_ptr<const Bytes> captured;
+                    if (capture_payload && !chunk->data) captured = staged ? staged->bytes :
+                        std::make_shared<const Bytes>(data.begin(), data.end());
+                    reads.push_back({chunk, i, at, std::move(captured)});
                 }
                 part.chunks.push_back(std::move(chunk)); at += count;
             }
@@ -848,6 +909,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                 (p_->storage->has_local_tier() && p_->storage->local_bytes(chunk.key, chunk.size) != chunk.size));
             if ((!target.ram || chunk.data) && !store) continue;
             std::shared_ptr<const Bytes> data = chunk.data;
+            if (!data) data = read.captured;
             if (!data) {
                 auto bytes = std::make_shared<Bytes>(size_t(chunk.size));
                 if (!sources[read.source].read(read.offset, bytes->data(), bytes->size(), error)) {

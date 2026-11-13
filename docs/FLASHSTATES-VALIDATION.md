@@ -17,9 +17,13 @@ These are correctness checks; they do not establish a workload speedup.
 | Tools/server | Tools suite: 921 tests, 40 skipped. Server suite: 953 tests, 40 skipped, pass on the final rerun; an earlier unchanged MCP crash-stderr timing failure also passed three focused reruns. State diagnostics and detokenizer checks pass |
 | Build coverage | CUDA GLM/Qwen, DeepSeek and MiniMax binaries build; the HIP CUDA-name compatibility check passes. CI includes Windows persistence and macOS Metal shader/adaptor compilation plus CPU oracle checks |
 
-The CUDA tests exercise one SM86 device. Native Qwen, DeepSeek and MiniMax model
-generation, other CUDA architectures, HIP hardware, Windows GPU execution and
-Metal GPU arithmetic were not exercised here. Build coverage and the Metal CPU
+The synthetic CUDA tests exercise one SM86 device. Native Qwen and MiniMax
+model generation, other CUDA architectures, HIP hardware, Windows GPU execution
+and Metal GPU arithmetic were not exercised here. Build coverage and the Metal CPU
 oracle do not substitute for those hardware checks. Local and optional shared
 storage are opt-in through `MAYA_STATE_CACHE=1`; see [controls and reproduction
 tools](FLASHSTATES.md).
+
+Real GLM and DeepSeek model loading, exact native-byte probes and the completed
+65-trial performance study are documented in [the performance report](FLASHSTATES-PERFORMANCE.md).
+That study does not extend generation coverage to the other backends listed above.
