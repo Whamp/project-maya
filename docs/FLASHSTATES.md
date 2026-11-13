@@ -21,6 +21,9 @@ arenas, allocator overhead, token metadata and transfer scratch.
 The feature starts disabled. The same controls work in the config's `env`
 object or through `./maya.sh --setup --env MAYA_STATE_CACHE=1`.
 
+Measured benefits, remaining costs and the enabled-main comparison are in
+[the performance report](FLASHSTATES-PERFORMANCE.md).
+
 ## Controls
 
 | Variable | Default | Meaning |
