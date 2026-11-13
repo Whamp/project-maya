@@ -18,7 +18,13 @@ With two `--exe`, every repeat runs both, in alternating order (an A/B run). Gre
 tokens banned (`--ban-eos`), so each answer has exactly `--output` tokens. The engine gets the config's `env`, then
 this run's cache settings (a private MAYA_STATE_DIR, `--ram-gb`, no SSD tier).
 
-Exit 0: every request answered. 2: the engine did not start, or a request failed.
+`--deterministic` adds the settings docs/SETTINGS.md gives for answers that repeat bit for bit (every expert on the
+GPU's kernels, prompt products independent of the expert cache, no background tier moves), and then every answer must
+equal the same request's answer in every other run, token for token. Use it to check answers, not to time the
+default recipe: it is slower.
+
+Exit 0: every request answered (and, with `--deterministic`, every answer matched). 1: an answer differed.
+2: the engine did not start, or a request failed.
 """
 from __future__ import annotations
 
@@ -36,7 +42,12 @@ import strata_tokenizer  # noqa: E402
 from parallel_test import Multi  # noqa: E402
 from slot_keep_test import text_tokens  # noqa: E402
 
-COUNTERS = ("publishes", "publish_ms", "read_bytes", "hashed_bytes", "restores", "restore_ms", "admitted",
+# docs/SETTINGS.md: the settings that make greedy answers repeat. GLM ("the same tokens after a restart"): every
+# expert on the GPU's kernels, prompt products independent of the expert cache, no tier moves or replanning.
+# DeepSeek ("an expert's bits wherever it sits"): lane parity, and the prompt pass picked by length, not timing.
+DETERMINISTIC = {"MAYA_GLM_CPU_LANE": "0", "MAYA_GLM_PREFILL_STABLE": "1", "MAYA_GLM_PROMOTE": "0",
+                 "MAYA_GLM_CPU_RETIME": "0", "MAYA_DS4_LANE_PARITY": "1", "MAYA_DS4_PROMPT_PICK": "length"}
+COUNTERS = ("publishes", "publish_ms", "read_bytes", "reused_bytes", "hashed_bytes", "restores", "restore_ms", "admitted",
             "rejected", "evicted", "hits", "restored_tokens")
 
 
@@ -84,6 +95,8 @@ def run(exe: str, size: int, args: argparse.Namespace, config: dict, tok) -> dic
         env.update({"MAYA_STATE_CACHE": "1", "MAYA_STATE_DIR": str(Path(scratch) / "state"),
                     "MAYA_STATE_RAM_GB": str(args.ram_gb), "MAYA_STATE_DISK_GB": "0",
                     "MAYA_STATE_MIGRATE": "0", "MAYA_GLM_SLOT_DIR": str(Path(scratch) / "slots")})
+        if args.deterministic:
+            env.update(DETERMINISTIC)
         env.update(dict(item.split("=", 1) for item in args.env))
         command = ["--serve"] + config["args"] + (["--layer-split", "auto"] if "--layer-split" not in config["args"]
                                                   else [])
@@ -121,6 +134,7 @@ def main() -> int:
     p.add_argument("--ban-eos", default="154820:-100,154827:-100,154829:-100")
     p.add_argument("--env", action="append", default=[], help="KEY=VALUE for the engine, after the config's")
     p.add_argument("--timeout", type=float, default=3600)
+    p.add_argument("--deterministic", action="store_true", help="repeatable answers; every answer must match")
     p.add_argument("--scratch", default=None, help="where each run's private cache directory goes")
     p.add_argument("--out", required=True)
     args = p.parse_args()
@@ -144,8 +158,18 @@ def main() -> int:
                     c = row["cache"]
                     print(f"{Path(exe).parent.name:>12} N={size:<7} {name} reused={row['reused']:<7} "
                           f"ttft={row['ttft_ms']:9.1f} ms  publish={c['publish_ms']:8.1f} ms "
-                          f"read={c['read_bytes'] / 2**20:9.1f} MiB  hashed={c['hashed_bytes'] / 2**20:9.1f} MiB "
+                          f"read={c['read_bytes'] / 2**20:9.1f} MiB  reused={c.get('reused_bytes', 0) / 2**20:9.1f} MiB  hashed={c['hashed_bytes'] / 2**20:9.1f} MiB "
                           f"restore={c['restore_ms']:7.1f} ms", flush=True)
+    if args.deterministic:
+        answers: dict = {}
+        for r in results:
+            for name, row in r["rows"].items():
+                answers.setdefault((r["size"], name), set()).add(tuple(row["tokens"]))
+        differing = sorted(key for key, seen in answers.items() if len(seen) > 1)
+        for size, name in differing:
+            print(f"DIFFERENT N={size} {name}: {len(answers[(size, name)])} distinct answers", flush=True)
+        print(f"answers: {len(answers) - len(differing)} of {len(answers)} requests identical in every run", flush=True)
+        return 1 if differing else 0
     return 0
 
 

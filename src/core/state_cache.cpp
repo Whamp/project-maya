@@ -251,7 +251,7 @@ std::shared_ptr<Storage> file_storage(const std::string& path) { return std::mak
 RegionSource bytes_source(std::string name, Bytes bytes) {
     auto owned = std::make_shared<const Bytes>(std::move(bytes));
     RegionSource source;
-    source.name = std::move(name); source.bytes = owned->size();
+    source.name = std::move(name); source.bytes = owned->size(); source.host = owned->data();
     source.read = [owned](uint64_t at, uint8_t* data, size_t n, std::string& error) {
         if (at > owned->size() || n > owned->size()-at) { error = "state sideband range invalid"; return false; }
         std::memcpy(data, owned->data()+at, n); return true;
@@ -750,6 +750,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                     const auto& old = before->chunks[k];
                     bool same;
                     if (!prints.empty()) same = p_->print_of(*old, *old->data) == prints[k];
+                    else if (source.host) same = std::memcmp(source.host + at, old->data->data(), count) == 0;
                     else {
                         auto live = std::make_shared<Bytes>(count);
                         if (!source.read(at, live->data(), count, error)) return false;
@@ -789,20 +790,32 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         Unit& target = *retained->second;
         const auto fail = [&] { target.pending = false; return false; };
         target.pending = true;   // pin every member while its reserved bytes become real
-        for (auto& read : reads) {
-            auto data = std::move(read.captured);
-            if (!data) {
-                auto bytes = std::make_shared<Bytes>(size_t(read.chunk->size));
-                if (!sources[read.source].read(read.offset, bytes->data(), bytes->size(), error)) {
-                    ++p_->stats.rejected; return fail();
-                }
-                p_->stats.read_bytes += bytes->size();
-                data = std::move(bytes);
+        Bytes run;
+        for (size_t r = 0; r < reads.size();) {
+            // A run of adjacent new chunks of one region is one native read (at most 8 MiB), or a host view.
+            size_t end = r + 1;
+            uint64_t bytes = reads[r].chunk->size;
+            if (!reads[r].captured)
+                while (end < reads.size() && !reads[end].captured && reads[end].source == reads[r].source &&
+                       reads[end].offset == reads[r].offset + bytes && bytes + reads[end].chunk->size <= (8ull << 20))
+                    bytes += reads[end++].chunk->size;
+            const auto& source = sources[reads[r].source];
+            const uint8_t* from = source.host ? source.host + reads[r].offset : nullptr;
+            if (!reads[r].captured && !from) {
+                run.resize(size_t(bytes));
+                if (!source.read(reads[r].offset, run.data(), run.size(), error)) { ++p_->stats.rejected; return fail(); }
+                from = run.data();
             }
-            if (target.ram) { read.chunk->data = std::move(data); continue; }
-            p_->print_of(*read.chunk, *data);   // the state does not fit in RAM: its new bytes go to storage now
-            if (!p_->storage->put(read.chunk->key, *data, error)) { ++p_->stats.write_failures; return fail(); }
-            read.chunk->stored = true;
+            if (!reads[r].captured) p_->stats.read_bytes += bytes;
+            for (uint64_t at = 0; r < end; at += reads[r++].chunk->size) {
+                auto& read = reads[r];
+                auto data = read.captured ? std::move(read.captured)
+                                          : std::make_shared<const Bytes>(from + at, from + at + read.chunk->size);
+                if (target.ram) { read.chunk->data = std::move(data); continue; }
+                p_->print_of(*read.chunk, *data);   // the state does not fit in RAM: its new bytes go to storage now
+                if (!p_->storage->put(read.chunk->key, *data, error)) { ++p_->stats.write_failures; return fail(); }
+                read.chunk->stored = true;
+            }
         }
         if (!target.ram) {
             for (const auto& chunk : members) {   // reused chunks only RAM held so far
@@ -966,10 +979,14 @@ bool StateCache::restore(const Lease& lease, const std::vector<RegionTarget>& ta
                     }
                     loaded = true;
                 }
-                for (const auto& bytes : data) {
-                    if (!target.write(at, bytes->data(), bytes->size(), error)) return false;
-                    at += bytes->size();
+                if (data.size() == 1) {
+                    if (!target.write(at, data[0]->data(), data[0]->size(), error)) return false;
+                } else {   // one native write a batch
+                    Bytes joined; joined.reserve(size_t(batch_bytes));
+                    for (const auto& bytes : data) joined.insert(joined.end(), bytes->begin(), bytes->end());
+                    if (!target.write(at, joined.data(), joined.size(), error)) return false;
                 }
+                at += batch_bytes;
                 // Small recovery units can return to RAM without retaining an
                 // extra full-unit buffer. Account each verified batch before the
                 // next read, and roll it back if active pins prevent admission.

@@ -78,6 +78,8 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaPointerAttributes hipPointerAttribute_t
 #define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaMemoryTypeUnregistered hipMemoryTypeUnregistered
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDeviceProperties hipGetDeviceProperties
 #define cudaGetErrorString hipGetErrorString

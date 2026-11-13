@@ -351,21 +351,22 @@ int main() {
             cache.release(lease);
         }
         {
-            auto c = config(); c.chunk_bytes = 64 << 10; c.ram_bytes = 5ull << 20;
+            auto c = config(); c.chunk_bytes = 64 << 10; c.ram_bytes = 16ull << 20;
             sc::StateCache cache(c);
             check(cache.publish(capture(prefix({9}), Bytes(c.chunk_bytes, 9)), error), "seed large capture rollback");
             const auto before = cache.stats();
             const auto caller = std::this_thread::get_id();
             size_t reads = 0;
             sc::RegionSource source;
-            source.name = "kv"; source.bytes = (4ull << 20)+3;
+            source.name = "kv"; source.bytes = (12ull << 20)+3;
             source.read = [&](uint64_t, uint8_t* out, size_t n, std::string& e) {
                 check(std::this_thread::get_id() == caller, "native reads stay on the publishing thread");
-                if (++reads == 3) { e = "injected native copy failure"; return false; }
+                check(n <= (8u << 20), "native reads are bounded batches");
+                if (++reads == 2) { e = "injected native copy failure"; return false; }
                 std::fill_n(out, n, uint8_t(1)); return true;
             };
-            check(!cache.publish(metadata(prefix({1,2})), {source}, error) && reads == 3 && error == "injected native copy failure",
-                  "a source failure after earlier chunks is reported");
+            check(!cache.publish(metadata(prefix({1,2})), {source}, error) && reads == 2 && error == "injected native copy failure",
+                  "a source failure after an earlier batch is reported");
             const auto after = cache.stats();
             check(after.units == before.units && after.ram_bytes == before.ram_bytes &&
                   after.logical_bytes == before.logical_bytes && !cache.find_resume(prefix({1,2,3})),
@@ -427,7 +428,7 @@ int main() {
                 sc::RegionSource source;
                 source.name = "kv"; source.bytes = 32;
                 source.read = [&](uint64_t at, uint8_t* out, size_t n, std::string& e) {
-                    if (++reads == 5) { e = "injected native copy failure"; return false; }
+                    if (++reads == 1) { e = "injected native copy failure"; return false; }
                     for (size_t i = 0; i < n; ++i) out[i] = uint8_t(at+i);
                     return true;
                 };

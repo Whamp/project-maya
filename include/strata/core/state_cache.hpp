@@ -58,6 +58,8 @@ struct RegionSource {
     // Optional: the fingerprint of each `chunk`-byte piece of the whole region, computed where its bytes live.
     // Without it, a reuse check reads the live bytes and compares them.
     std::function<bool(size_t chunk, std::vector<uint64_t>&, std::string&)> fingerprints;
+    // Optional: the region's bytes when they are one host-memory range, read and compared in place.
+    const uint8_t* host = nullptr;
 };
 struct RegionTarget {
     std::string name;

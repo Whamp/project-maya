@@ -144,7 +144,12 @@ bool memory_sources(const std::vector<MemoryRegion>& memory, int device,
                 cudaSetDevice(before);
                 return ok;
             };
-        } else cudaGetLastError();   // (a host pointer is not an error worth keeping)
+        } else if (region.segments.size() == 1 && bytes &&
+                   cudaPointerGetAttributes(&where, region.segments[0].address) == cudaSuccess &&
+                   (where.type == cudaMemoryTypeHost || where.type == cudaMemoryTypeUnregistered)) {
+            source.host = static_cast<const uint8_t*>(region.segments[0].address);
+        }
+        cudaGetLastError();   // (a pointer the runtime does not know is not an error worth keeping)
         out.push_back(std::move(source));
     }
     return true;
