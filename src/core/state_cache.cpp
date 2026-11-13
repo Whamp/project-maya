@@ -305,6 +305,7 @@ struct StateCache::Unit {
     uint64_t uses = 0;
     uint64_t min_prompt_tokens = 0;
     bool sampling_ready = false, anchor = false, frontier = false, ram = true, stored = false, pending = false, dead = false;
+    std::set<Unit*> above, below;   // the held states this one extends, and those that extend it
 };
 
 struct StateCache::Impl {
@@ -380,6 +381,21 @@ struct StateCache::Impl {
         return std::make_shared<const Bytes>(std::move(b));
     }
 
+    // The prefix graph: relations are found once, when a state is added, and removed with it.
+    void link(Unit& u) {
+        for (auto& [key, other] : units) {
+            (void) key;
+            if (other.get() == &u || other->prefix.tokens.size() == u.prefix.tokens.size()) continue;
+            if (extends(u.prefix, other->prefix)) { u.above.insert(other.get()); other->below.insert(&u); }
+            else if (extends(other->prefix, u.prefix)) { u.below.insert(other.get()); other->above.insert(&u); }
+        }
+    }
+    void unlink(Unit& u) {
+        for (auto* a : u.above) a->below.erase(&u);
+        for (auto* d : u.below) d->above.erase(&u);
+        u.above.clear(); u.below.clear();
+    }
+    void remove(std::map<std::string, std::shared_ptr<Unit>>::iterator it) { unlink(*it->second); units.erase(it); }
     std::set<const Chunk*> holders(const Unit& u) const {
         std::set<const Chunk*> set;
         for (const auto& p : u.parts) for (const auto& c : p.chunks) set.insert(c.get());
@@ -427,33 +443,22 @@ struct StateCache::Impl {
     double gain(const Unit& unit) const {
         if (unit.dead) return 0;
         size_t fallback = 0;
-        for (const auto& [key, u] : units) {
-            (void) key;
-            if (u.get() != &unit && !u->dead && u->prefix.tokens.size() < unit.prefix.tokens.size() &&
-                extends(unit.prefix, u->prefix)) fallback = std::max(fallback, u->prefix.tokens.size());
-        }
+        for (const auto* u : unit.above) if (!u->dead) fallback = std::max(fallback, u->prefix.tokens.size());
         return config.cost.seconds(fallback, unit.prefix.tokens.size());
     }
     void retire_frontiers(const Unit& newest) {
         if (!newest.frontier) return;
         std::vector<Unit*> ancestors;
-        for (auto& [key, u] : units) {
-            (void) key;
-            if (u.get() != &newest && u->frontier && !u->anchor && !u->dead &&
-                u->prefix.tokens.size() < newest.prefix.tokens.size() && extends(newest.prefix, u->prefix))
-                ancestors.push_back(u.get());
-        }
+        for (auto* u : newest.above) if (u->frontier && !u->anchor && !u->dead) ancestors.push_back(u);
         std::sort(ancestors.begin(), ancestors.end(), [](const auto* a, const auto* b) {
             return a->prefix.tokens.size() > b->prefix.tokens.size();
         });
         for (size_t i = config.supersede_lag; i < ancestors.size(); ++i) {
             Unit& old = *ancestors[i];
             bool branch = false;
-            for (const auto& [key, other] : units) {
-                (void) key;
-                if (!other->dead && extends(other->prefix, old.prefix) &&
-                    !extends(newest.prefix, other->prefix) && !extends(other->prefix, newest.prefix)) branch = true;
-            }
+            for (const auto* other : old.below)
+                if (!other->dead && other != &newest && !newest.above.count(const_cast<Unit*>(other)) &&
+                    !newest.below.count(const_cast<Unit*>(other))) branch = true;
             if (!branch) old.dead = true;
         }
     }
@@ -462,14 +467,11 @@ struct StateCache::Impl {
         if (!config.leaf_last) return 1;
         size_t children = 0;
         std::set<int32_t> branches;
-        for (const auto& [key, u] : units) {
-            (void) key;
-            if (u.get() != &unit && !u->dead && u->prefix.tokens.size() > unit.prefix.tokens.size() &&
-                extends(u->prefix, unit.prefix)) {
+        for (const auto* u : unit.below)
+            if (!u->dead && u->prefix.tokens.size() > unit.prefix.tokens.size()) {
                 ++children;
                 branches.insert(u->prefix.tokens[unit.prefix.tokens.size()]);
             }
-        }
         if ((config.anchor_tier && unit.anchor) || unit.uses > 1 || branches.size() > 1) return 2;
         if (children || (config.idle_seconds > 0 && clock() - unit.used_at >= config.idle_seconds)) return 1;
         return 2;
@@ -539,6 +541,7 @@ struct StateCache::Impl {
                 const auto expected = fingerprint(b.data(), r.at);
                 if (r.n() != expected || r.at != b.size() || unit_key(*u) != key) continue;
                 u->ram = false; u->stored = true; u->used_at = clock(); units[key] = std::move(u);
+                link(*units[key]);
             } catch (const std::exception&) { ++stats.read_failures; }
         }
         account();
@@ -597,7 +600,7 @@ struct StateCache::Impl {
             for (const auto& [k, u] : units) if (k != key && holders(*u).count(c)) { shared = true; break; }
             if (!shared && c->stored) erase.push_back(c->key);
         }
-        units.erase(it); ++stats.evicted;
+        remove(it); ++stats.evicted;
         for (const auto& chunk : retained) {
             bool in_ram = false;
             for (const auto& [other_key, unit] : units) {
@@ -716,7 +719,10 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         ~Cleanup() {
             if (!complete && !key.empty()) {
                 try { cache.drop(key); }
-                catch (...) { cache.units.erase(key); ++cache.stats.write_failures; }
+                catch (...) {
+                    if (const auto it = cache.units.find(key); it != cache.units.end()) cache.remove(it);
+                    ++cache.stats.write_failures;
+                }
             }
             for (const auto& c : chunks) c->reserved_ram = c->reserved_disk = false;
             try { cache.account(); } catch (...) { ++cache.stats.write_failures; }
@@ -783,7 +789,8 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         }
         // Admission before any copy: the policy sees the bytes this state would add.
         unit->key = key; admitted_key = key;
-        p_->units.emplace(key, std::move(unit));   // (no local reference: a pinned unit could not be evicted)
+        Unit& added = *p_->units.emplace(key, std::move(unit)).first->second;   // (no local reference: a pinned unit could not be evicted)
+        p_->link(added);
         p_->trim();
         const auto retained = p_->units.find(key);
         if (retained == p_->units.end()) { ++p_->stats.rejected; admitted_key.clear(); return false; }
