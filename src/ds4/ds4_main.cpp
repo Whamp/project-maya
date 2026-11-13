@@ -2244,10 +2244,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (lk_owner == a.r.rid) lk_owner = -1;
         };
         const auto finish_act = [&](Act& a) {
-            bind(a.seq);
-            const int64_t committed = int64_t(a.r.ids.size()) + std::max<long long>(0, a.produced - 1);
-            if (!state_cache || a.reading || m.state_commit(committed, err)) state_publish(held, true, true);
-            else std::fprintf(stderr, "ds4 state cache: stopped frontier skipped (%s)\n", err.c_str());
+            if (state_cache) {
+                bind(a.seq);
+                const int64_t committed = int64_t(a.r.ids.size()) + std::max<long long>(0, a.produced - 1);
+                if (a.reading || m.state_commit(committed, err)) state_publish(held, true, true);
+                else std::fprintf(stderr, "ds4 state cache: stopped frontier skipped (%s)\n", err.c_str());
+            }
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
             end_note();

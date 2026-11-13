@@ -255,6 +255,27 @@ int main() {
             std::filesystem::remove_all(dir);
         }
         {
+            // A state bigger than RAM that reuses a RAM-only ancestor's rows, where admission evicts that ancestor.
+            const auto dir = scratch("maya-state-evicted-parent-");
+            auto c = config(); c.directory = dir.string(); c.ram_bytes = 8; c.max_units = 1; c.leaf_last = true;
+            c.write_through = false;
+            {
+                sc::StateCache cache(c);
+                Native kv{{1, 2, 3, 4, 5, 6, 7, 8}};
+                check(cache.publish(metadata(prefix({1, 2})), {kv.source("kv", true, false, 4)}, error), "RAM-only parent");
+                kv.bytes.insert(kv.bytes.end(), {9, 10, 11, 12, 13, 14, 15, 16});
+                const bool kept = cache.publish(metadata(prefix({1, 2, 3})), {kv.source("kv", true, false, 4)}, error);
+                check(cache.stats().units <= 1, "the state limit holds");
+                if (kept) check(restore(cache, prefix({1, 2, 3, 4}), "kv", error) == kv.bytes, "a kept child restores exactly");
+                else check(!cache.find_resume(prefix({1, 2, 3, 4})) || bool(cache.find_resume(prefix({1, 2, 9}))),
+                           "a refused child leaves no partial state");
+                Native other{{7, 7, 7, 7}};
+                check(cache.publish(metadata(prefix({5})), {other.source("kv", false, false, 4)}, error) &&
+                      restore(cache, prefix({5, 6}), "kv", error) == other.bytes, "the cache stays usable");
+            }
+            std::filesystem::remove_all(dir);
+        }
+        {
             auto storage = std::make_shared<FailingStorage>();
             sc::StateCache cache(config(), storage);
             check(cache.publish(metadata(prefix({7})), {sc::bytes_source("kv", {1,2,3,4})}, error),

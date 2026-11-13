@@ -8326,6 +8326,8 @@ std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const GlmStateLayout& lay,
 bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
                               std::vector<statecache::RegionSource>& sources, std::string& err) {
     ckpt_join(); sources.clear();
+    int caller = dev_;
+    cudaGetDevice(&caller);   // (restored on return: a publish can run between decode steps)
     const int64_t n = int64_t(prefix.tokens.size());
     if (n <= 0) { err = "state cache: empty GLM prefix"; return false; }
     const auto fp = state_fp();
@@ -8343,11 +8345,11 @@ bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
             (checkpoint < 0 ? m->snap_pos_ != n
                             : size_t(checkpoint) >= m->ckpt_pos_.size() || m->ckpt_pos_[size_t(checkpoint)] != n)) {
             err = "state cache: GLM checkpoint is not materialized at the requested position";
-            cudaSetDevice(dev_); return false;
+            cudaSetDevice(caller); return false;
         }
         cudaSetDevice(m->dev_);
         if (cudaStreamSynchronize(m->fast_->cs) != cudaSuccess) {
-            err = "state cache: GLM capture stream failed"; cudaSetDevice(dev_); return false;
+            err = "state cache: GLM capture stream failed"; cudaSetDevice(caller); return false;
         }
         const auto& g = m->g_;
         const size_t run = size_t(m->lay_.kda_run());
@@ -8363,13 +8365,14 @@ bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
         std::vector<statecache::MemoryRegion> memory{
             {base+"recurrent", {{const_cast<float*>(saved), recurrent*run*sizeof(float)}}},
             {base+"open-pool", {{const_cast<float*>(pool), pool_bytes}}}};
-        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(dev_); return false; }
+        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(caller); return false; }
         if (pool_bytes && !m->lay_.glm_dsa()) {
             auto read = sources.back().read;
             const size_t rows = size_t(g.idx_kpool-1)*g.idx_key;
             const size_t valid = size_t(n%g.idx_kpool)*g.idx_key;
             const size_t nextn_valid = size_t(std::max<int64_t>(0, n-1)%g.idx_kpool)*g.idx_key;
             const bool nextn = m->mtp_il_ >= 0;
+            sources.back().host = nullptr;   // (the rows past the open pool's end are zeroed on every read)
             sources.back().read = [read, rows, valid, nextn_valid, nextn](uint64_t at, uint8_t* dst, size_t count, std::string& error) {
                 if (!read(at, dst, count, error)) return false;
                 for (size_t i = 0; i < count; ++i) {
@@ -8384,9 +8387,10 @@ bool Glm5Model::state_sources(const statecache::Prefix& prefix, int checkpoint,
         memory.clear();
         for (size_t i = 0; i < runs.size(); ++i)
             memory.push_back({base+"attention-"+std::to_string(i), {{runs[i].first, size_t(runs[i].second)*sizeof(float)}}, true});
-        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(dev_); return false; }
+        if (!statecache::memory_sources(memory, m->dev_, transfer, sources, err)) { cudaSetDevice(caller); return false; }
     }
-    cudaSetDevice(dev_);
+    cudaSetDevice(dev_);   // (the NextN carrier and the drafter run on the chain's first device)
+    struct Restore { int device; ~Restore() { cudaSetDevice(device); } } restore{caller};
     std::ostringstream carrier(std::ios::binary);
     if (checkpoint < 0 && lay_.glm_dsa() && !mtp_slot_put(carrier, err)) return false;
     const auto bytes = carrier.str();

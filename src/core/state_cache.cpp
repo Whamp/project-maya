@@ -295,6 +295,9 @@ struct Chunk {
     std::shared_ptr<const Bytes> data;
     bool stored = false;
     bool reserved_ram = false, reserved_disk = false;
+    // Scratch of one bookkeeping pass (under the cache lock): the pass that last saw it, and what it counted.
+    mutable uint64_t pass = 0;
+    mutable uint32_t marks = 0;
 };
 struct Part { std::string name; std::vector<std::shared_ptr<Chunk>> chunks; };
 struct StateCache::Unit {
@@ -328,6 +331,13 @@ struct StateCache::Impl {
     std::thread worker;
     std::string salt;
     uint64_t named = 0;
+    mutable uint64_t passes = 0;
+    // Starts a bookkeeping pass; mark() then returns a chunk's marks from this pass (zero the first time).
+    uint64_t begin_pass() const { return ++passes; }
+    static uint32_t& mark(const Chunk& c, uint64_t pass) {
+        if (c.pass != pass) { c.pass = pass; c.marks = 0; }
+        return c.marks;
+    }
 
     Impl(Config c, std::shared_ptr<Storage> s, std::function<double()> now)
         : config(std::move(c)), storage(std::move(s)), clock(std::move(now)) {
@@ -356,7 +366,7 @@ struct StateCache::Impl {
     }
     void touch_later(const std::string& key) {
         if (writes.size() >= 65536) { ++stats.write_failures; return; }
-        Job job; job.touch = key; writes.push_back(std::move(job)); cv.notify_one();
+        Job job; job.touch = key; writes.push_back(std::move(job)); cv.notify_all();
     }
     std::string chunk_name() {
         char buf[48]; std::snprintf(buf, sizeof(buf), "chunk-%s-%llx", salt.c_str(), (unsigned long long) ++named);
@@ -396,10 +406,11 @@ struct StateCache::Impl {
         u.above.clear(); u.below.clear();
     }
     void remove(std::map<std::string, std::shared_ptr<Unit>>::iterator it) { unlink(*it->second); units.erase(it); }
-    std::set<const Chunk*> holders(const Unit& u) const {
-        std::set<const Chunk*> set;
-        for (const auto& p : u.parts) for (const auto& c : p.chunks) set.insert(c.get());
-        return set;
+    // A state's chunks; it holds each one once (a reused chunk keeps its region and position).
+    std::vector<const Chunk*> holders(const Unit& u) const {
+        std::vector<const Chunk*> list;
+        for (const auto& p : u.parts) for (const auto& c : p.chunks) list.push_back(c.get());
+        return list;
     }
     void account() {
         stats.ram_bytes = stats.disk_bytes = stats.logical_bytes = 0;
@@ -408,14 +419,14 @@ struct StateCache::Impl {
         stats.pending_updates = active_updates;
         for (const auto& job : writes) stats.pending_updates += !job.unit;
         stats.units = units.size();
-        std::set<const Chunk*> seen;
+        const auto pass = begin_pass();
         for (const auto& [key, u] : units) {
             (void) key;
             stats.pending_writes += u->pending;
             stats.pinned_units += pinned(u);
             for (const auto& p : u->parts) for (const auto& c : p.chunks) {
                 stats.logical_bytes += c->size;
-                if (seen.insert(c.get()).second) {
+                if (!mark(*c, pass)++) {
                     stats.unique_bytes += c->size;
                     if (c->data || c->reserved_ram) stats.ram_bytes += c->size;
                     const auto disk = c->stored && storage ? storage->local_bytes(c->key, c->size) : 0;
@@ -425,15 +436,22 @@ struct StateCache::Impl {
         }
         stats.shared_bytes = stats.logical_bytes - stats.unique_bytes;
     }
-    uint64_t freeable(const Unit& unit, bool ram) const {
-        auto alone = holders(unit);
-        for (const auto& [key, other] : units) {
+    // How many held states keep each chunk alive (a chunk's marks in the returned pass): in the RAM tier, the
+    // states in RAM or pinned; on disk, all of them.
+    uint64_t keepers(bool ram) const {
+        const auto pass = begin_pass();
+        for (const auto& [key, u] : units) {
             (void) key;
-            if (other.get() == &unit || (ram && !other->ram && other.use_count() == 1 && !other->pending)) continue;
-            for (const auto& p : other->parts) for (const auto& c : p.chunks) alone.erase(c.get());
+            if (ram && !u->ram && u.use_count() == 1 && !u->pending) continue;
+            for (const auto& p : u->parts) for (const auto& c : p.chunks) ++mark(*c, pass);
         }
+        return pass;
+    }
+    uint64_t freeable(const Unit& unit, bool ram, uint64_t pass) const {
         uint64_t bytes = 0;
-        for (const auto* c : alone) {
+        for (const auto& p : unit.parts) for (const auto& chunk : p.chunks) {
+            const Chunk* c = chunk.get();
+            if (c->pass == pass && c->marks > 1) continue;
             if (ram && (c->data || c->reserved_ram)) bytes += c->size;
             else if (!ram && c->reserved_disk) bytes += c->size;
             else if (!ram && c->stored && storage) bytes += storage->local_bytes(c->key, c->size);
@@ -476,8 +494,8 @@ struct StateCache::Impl {
         if (children || (config.idle_seconds > 0 && clock() - unit.used_at >= config.idle_seconds)) return 1;
         return 2;
     }
-    std::pair<int, double> score(const Unit& u, bool ram) const {
-        const auto size = freeable(u, ram);
+    std::pair<int, double> score(const Unit& u, bool ram, uint64_t pass) const {
+        const auto size = freeable(u, ram, pass);
         return {tier(u), size ? u.stamp + gain(u) / double(size) : std::numeric_limits<double>::infinity()};
     }
     bool pinned(const std::shared_ptr<Unit>& unit) const { return unit.use_count() > 1 || unit->pending; }
@@ -594,21 +612,16 @@ struct StateCache::Impl {
         const auto owned = holders(*it->second);
         std::vector<std::shared_ptr<Chunk>> retained;
         for (const auto& part : it->second->parts) for (const auto& chunk : part.chunks) retained.push_back(chunk);
+        const auto pass = begin_pass();   // marks: 1 another state holds it, 2 one of them in RAM or pinned
+        for (const auto& [k, u] : units) {
+            if (k == key) continue;
+            const uint32_t held = u->ram || pinned(u) ? 3 : 1;
+            for (const auto& p : u->parts) for (const auto& c : p.chunks) mark(*c, pass) |= held;
+        }
         std::vector<std::string> erase;
-        for (const auto* c : owned) {
-            bool shared = false;
-            for (const auto& [k, u] : units) if (k != key && holders(*u).count(c)) { shared = true; break; }
-            if (!shared && c->stored) erase.push_back(c->key);
-        }
+        for (const auto* c : owned) if (!(mark(*c, pass) & 1) && c->stored) erase.push_back(c->key);
         remove(it); ++stats.evicted;
-        for (const auto& chunk : retained) {
-            bool in_ram = false;
-            for (const auto& [other_key, unit] : units) {
-                (void) other_key;
-                if ((unit->ram || pinned(unit)) && holders(*unit).count(chunk.get())) { in_ram = true; break; }
-            }
-            if (!in_ram) chunk->data.reset();
-        }
+        for (const auto& chunk : retained) if (!(mark(*chunk, pass) & 2)) chunk->data.reset();
         if (storage) {
             try {
                 std::string error;
@@ -632,22 +645,23 @@ struct StateCache::Impl {
             const bool count = units.size() > config.max_units;
             if (!ram && !disk && !count) break;
             auto best = units.end(); std::pair<int, double> rank{3, std::numeric_limits<double>::infinity()};
+            const auto kept = keepers(ram);   // (a pass: scores read its marks before any other pass)
             for (auto it = units.begin(); it != units.end(); ++it) {
                 if (pinned(it->second) || (ram && !it->second->ram)) continue;
-                const auto candidate = score(*it->second, ram);
+                const auto candidate = score(*it->second, ram, kept);
                 if (candidate < rank) { rank = candidate; best = it; }
             }
             if (best == units.end()) break;
             if ((!config.leaf_last || rank.first == 2) && std::isfinite(rank.second))
                 stats.watermark = std::max(stats.watermark, rank.second);
             if (ram && best->second->stored && !disk && !count) {
-                auto exclusive = holders(*best->second);
                 best->second->ram = false;
+                const auto pass = begin_pass();   // marks: held by a state in RAM or pinned
                 for (const auto& [key, u] : units) {
                     (void) key;
-                    if (u->ram || pinned(u)) for (const auto* c : holders(*u)) exclusive.erase(c);
+                    if (u->ram || pinned(u)) for (const auto& p : u->parts) for (const auto& c : p.chunks) mark(*c, pass) = 1;
                 }
-                for (const auto* c : exclusive) const_cast<Chunk*>(c)->data.reset();
+                for (const auto& p : best->second->parts) for (const auto& c : p.chunks) if (!mark(*c, pass)) c->data.reset();
                 ++stats.demoted;
             } else { const std::string key = best->first; drop(key); }
             account();
@@ -827,6 +841,9 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         if (!target.ram) {
             for (const auto& chunk : members) {   // reused chunks only RAM held so far
                 if (chunk->stored && p_->storage->local_bytes(chunk->key, chunk->size) == chunk->size) continue;
+                if (!chunk->data) {   // (admission evicted the RAM-only ancestor that held it)
+                    error = "state chunk evicted during admission"; ++p_->stats.rejected; return fail();
+                }
                 p_->print_of(*chunk, *chunk->data);
                 if (!p_->storage->put(chunk->key, *chunk->data, error)) { ++p_->stats.write_failures; return fail(); }
                 chunk->stored = true;
@@ -840,7 +857,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         if (p_->storage && p_->config.disk_bytes && p_->config.write_through && !target.stored) {
             target.pending = true;   // the queued write pins it until the worker finishes
             Impl::Job job; job.unit = retained->second;
-            p_->writes.push_back(std::move(job)); p_->cv.notify_one();
+            p_->writes.push_back(std::move(job)); p_->cv.notify_all();
         }
         p_->retire_frontiers(target);
         complete = true; return true;
