@@ -88,6 +88,8 @@ struct Stats {
     uint64_t pending_updates = 0;
     uint64_t unique_bytes = 0, shared_bytes = 0, pinned_units = 0;
     uint64_t ram_hits = 0, disk_hits = 0, remote_hits = 0;
+    uint64_t publishes = 0, read_bytes = 0, hashed_bytes = 0, restores = 0;
+    double publish_seconds = 0, restore_seconds = 0;
 };
 
 class Storage {

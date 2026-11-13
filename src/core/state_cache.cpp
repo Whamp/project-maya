@@ -34,6 +34,11 @@
 
 namespace strata::core::statecache {
 namespace {
+struct Elapsed {   // adds the wall time of a scope to a counter
+    double& total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~Elapsed() { total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
+};
 uint64_t hash(std::span<const uint8_t> b) {
     uint64_t h = 1469598103934665603ull;
     for (uint8_t v : b) h = (h ^ v) * 1099511628211ull;
@@ -745,6 +750,8 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
         error = "streaming capture metadata is incomplete"; return false;
     }
     std::unique_lock lock(p_->mutex);
+    ++p_->stats.publishes;
+    Elapsed elapsed{p_->stats.publish_seconds};
     if (!p_->config.max_units) { ++p_->stats.rejected; return false; }
     struct Read {
         std::shared_ptr<Chunk> chunk;
@@ -819,6 +826,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                     const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
                     auto bytes = std::make_shared<Bytes>(count);
                     if (!source.read(at, bytes->data(), count, error)) return false;
+                    p_->stats.read_bytes += count;
                     prepared.push_back({std::move(bytes), 0, {}}); at += count;
                 }
             }
@@ -848,6 +856,8 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                 const size_t count = size_t(std::min<uint64_t>(p_->config.chunk_bytes, source.bytes-at));
                 const auto* staged = parallel_hash ? &prepared[prepared_at++] : nullptr;
                 if (!staged && !source.read(at, scratch.data(), count, error)) return false;
+                if (!staged) p_->stats.read_bytes += count;
+                p_->stats.hashed_bytes += count;
                 const auto data = staged ? std::span<const uint8_t>(*staged->bytes) :
                     std::span<const uint8_t>(scratch.data(), count);
                 const auto checksum = staged ? staged->checksum : hash(data);
@@ -915,6 +925,7 @@ bool StateCache::publish(Capture metadata, const std::vector<RegionSource>& sour
                 if (!sources[read.source].read(read.offset, bytes->data(), bytes->size(), error)) {
                     ++p_->stats.rejected; target.pending = false; return false;
                 }
+                p_->stats.read_bytes += bytes->size(); p_->stats.hashed_bytes += bytes->size();
                 if (hash(*bytes) != chunk.checksum || "chunk-" + content_digest(bytes->data(), bytes->size()) != chunk.key) {
                     error = "native state changed during capture"; ++p_->stats.rejected; target.pending = false; return false;
                 }
@@ -1053,6 +1064,14 @@ bool StateCache::restore(const Lease& lease, std::vector<Region>& regions, std::
 bool StateCache::restore(const Lease& lease, const std::vector<RegionTarget>& targets, std::string& error) {
     error.clear();
     if (!lease) { error = "empty state lease"; return false; }
+    struct Timed {
+        Impl& cache;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~Timed() {
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            std::lock_guard lock(cache.mutex); ++cache.stats.restores; cache.stats.restore_seconds += s;
+        }
+    } timed{*p_};
     { std::lock_guard lock(p_->mutex);
       if (lease.unit_->dead) { error = "state recovery unit was invalidated"; return false; } }
     try {
@@ -1244,6 +1263,8 @@ std::string StateCache::report() const {
         << " watermark=" << s.watermark << " cost_d=" << s.cost_per_token << " cost_e=" << s.cost_per_token_per_100k
         << " calibration_samples=" << s.calibration_samples << " pending_writes=" << s.pending_writes
         << " pending_updates=" << s.pending_updates;
+    out << " publishes=" << s.publishes << " publish_ms=" << s.publish_seconds * 1000 << " read_bytes=" << s.read_bytes
+        << " hashed_bytes=" << s.hashed_bytes << " restores=" << s.restores << " restore_ms=" << s.restore_seconds * 1000;
     out << " unique_bytes=" << s.unique_bytes << " shared_bytes=" << s.shared_bytes << " pinned_units=" << s.pinned_units
         << " ram_hits=" << s.ram_hits << " disk_hits=" << s.disk_hits << " remote_hits=" << s.remote_hits;
     return out.str();
