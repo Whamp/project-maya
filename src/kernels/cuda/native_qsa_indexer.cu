@@ -240,15 +240,4 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-void native_qsa_indexer_export_tail(const float* raw, int64_t n, int64_t p0,
-                                    const float* previous, float* checkpoint, void* stream) {
-    if (!raw || !previous || !checkpoint || !stream || n <= 0 || p0 < 0 || checkpoint == previous)
-        throw std::invalid_argument("QSA tail export: invalid endpoint or buffers");
-    auto st = static_cast<cudaStream_t>(stream);
-    auto error = cudaMemcpyAsync(checkpoint, previous, (R - 1) * D * sizeof(float), cudaMemcpyDeviceToDevice, st);
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-    append_tail<<<R - 1, D, 0, st>>>(raw, n, p0, checkpoint);
-    error = cudaGetLastError();
-    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
-}
 } // namespace strata::kernels

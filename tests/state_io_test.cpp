@@ -1,4 +1,4 @@
-#include "strata/core/session_state_cache.hpp"
+#include "strata/core/state_io.hpp"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -8,7 +8,6 @@
 #include <tuple>
 
 namespace sc = strata::core::statecache;
-namespace core = strata::core;
 
 void require(bool ok, const std::string& why) { if (!ok) throw std::runtime_error(why); }
 int main() {
@@ -118,38 +117,6 @@ int main() {
         }
         std::filesystem::remove_all(directory);
         cudaFree(device);
-        // Real QSA layouts: permuted resident pages, all supported dtypes, and a
-        // partial final page. Captures never include the unwritten tail capacity.
-        for (int format = 0; format < 4; ++format) {
-            core::qsa_set_kv_int8(format == 1);
-            core::qsa_set_kv_q4(format == 2);
-            core::qsa_set_kv_hybrid(format == 3);
-            core::ModelGeometry geometry;
-            const size_t size = core::qsa_state_bytes(geometry, 16);
-            void* arena = nullptr;
-            require(cudaMalloc(&arena, size) == cudaSuccess, "allocate QSA fixture");
-            core::QsaState state;
-            require(core::qsa_state_init(geometry, 16, arena, state) != 0, "initialize QSA fixture");
-            const int32_t pages[] = {2, 0, 3, 1};
-            require(cudaMemcpy(state.page_table, pages, sizeof(pages), cudaMemcpyHostToDevice) == cudaSuccess, "permute pages");
-            memory.clear(); saved.clear(); out.clear();
-            require(core::qsa_state_regions(geometry, state, 7, "qsa", true, memory, error), error);
-            size_t serial = 0;
-            for (auto& region : memory) for (auto& segment : region.segments) {
-                sc::Bytes seed(segment.bytes);
-                for (size_t i = 0; i < seed.size(); ++i) seed[i] = uint8_t(i * 13 + serial++);
-                require(cudaMemcpy(segment.address, seed.data(), seed.size(), cudaMemcpyHostToDevice) == cudaSuccess, "seed physical view");
-            }
-            require(sc::capture_memory(memory, saved, error), error);
-            for (auto& region : memory) for (auto& segment : region.segments)
-                require(cudaMemset(segment.address, 0, segment.bytes) == cudaSuccess, "overwrite live cells");
-            require(sc::restore_memory(memory, saved, error) && sc::capture_memory(memory, out, error), error);
-            require(out.size() == saved.size(), "complete QSA member set");
-            for (size_t i = 0; i < out.size(); ++i) require(out[i].bytes == saved[i].bytes, "QSA layout roundtrip");
-            // These one-time QSA allocations use pinned step/position staging.
-            cudaFreeHost(state.host_step); cudaFreeHost(state.host_pos);
-            cudaFree(arena);
-        }
-        std::puts("state IO: bounded staging, overlaid views, invalid payloads and four QSA formats passed");
+        std::puts("state IO: bounded staging, overlaid views, invalid payloads, fingerprints and row reuse passed");
     } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

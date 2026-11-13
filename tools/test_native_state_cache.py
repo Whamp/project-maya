@@ -26,7 +26,6 @@ class Engine:
             MAYA_STATE_DIR=str(directory),
             MAYA_STATE_RAM_GB=os.environ.get("MAYA_TEST_STATE_RAM_GB", "1"),
             MAYA_STATE_DISK_GB="1",
-            MAYA_STATE_BACKEND="local",
         )
         if legacy is not None:
             env.update(

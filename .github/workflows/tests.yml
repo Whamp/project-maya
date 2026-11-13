@@ -65,20 +65,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./state_cache_test.exe
 
-  state-metal:
-    runs-on: macos-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install numpy
-      - name: Build Metal shaders and native adapters
-        run: cmake -S . -B build -DMAYA_ENABLE_METAL=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DMAYA_PYTHON3=$(which python) -DMAYA_MM3_PYTHON3=$(which python)
-      - run: cmake --build build --parallel 3
-      - name: State restore and compact speculative parity on CPU oracle
-        env:
-          MAYA_METAL_CPU: "1"
-          MAYA_MM3_CPU: "1"
-        run: ctest --test-dir build --output-on-failure -R '^(state_cache_test|metal_allocator_free_blocks|metal_model_test_cpu|metal_mm3_test_cpu|metal_state_cache_test|metal_model_window)$'

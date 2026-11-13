@@ -25,7 +25,6 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
-#include "qwen_state_cache.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
@@ -7460,43 +7459,6 @@ int main(int argc, char** argv) {
             for (const ImgKey& k : all) if (k.start < L) v.push_back(k);
             return v;
         };
-        std::unique_ptr<strata::program::QwenStateCache> conversation_states;
-        if (const char* enabled = std::getenv("MAYA_STATE_CACHE"); enabled && std::atoi(enabled)) {
-            int device = 0;
-            cudaGetDevice(&device);
-            std::vector<strata::program::QwenStateCache::Stage> devices{{device, &ss}};
-            for (auto& stage : stages) devices.push_back({stage->dev, &stage->ss});
-            try {
-                auto config = strata::core::statecache::Config::environment(
-                    (std::filesystem::path(o.pack) / "state-cache").string());
-                conversation_states = std::make_unique<strata::program::QwenStateCache>(g, std::move(devices), mtp, config);
-            } catch (const std::exception& e) { std::fprintf(stderr, "maya state cache: %s\n", e.what()); }
-        }
-        const std::string conversation_identity = [&] {
-            std::ostringstream id;
-            id << "qwen-state-1 engine=" << STRATA_VERSION << " pack=" << std::filesystem::absolute(o.pack).string()
-               << " stages=" << n_stages << " kv=" << o.kv;
-            for (auto boundary : split_at) id << " split=" << boundary;
-            std::error_code ec;
-            for (const char* file : {"index.txt", "dense.bin", "native_experts.txt"}) {
-                const auto path = std::filesystem::path(o.pack) / file;
-                id << " " << file << ":" << std::filesystem::file_size(path, ec) << ":"
-                   << std::filesystem::last_write_time(path, ec).time_since_epoch().count();
-            }
-            for (const auto& cv : o.cvec_files) {
-                id << " cv=" << std::filesystem::absolute(cv.first).string() << ":" << cv.second << ":"
-                   << std::filesystem::file_size(cv.first, ec) << ":"
-                   << std::filesystem::last_write_time(cv.first, ec).time_since_epoch().count();
-            }
-            return id.str();
-        }();
-        const auto conversation_prefix = [&](const std::vector<int32_t>& tokens, const std::vector<ImgKey>& images) {
-            strata::core::statecache::Prefix prefix;
-            prefix.identity = conversation_identity + " cvec=" + std::to_string(cvec_cached);
-            prefix.tokens = tokens;
-            for (const auto& image : images) prefix.extra.push_back({uint64_t(image.start), 1, std::to_string(image.hash)});
-            return prefix;
-        };
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
@@ -7508,10 +7470,10 @@ int main(int argc, char** argv) {
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L).
         // `written`: the tokens the session consumed instead of `cur` (a checkpoint inside the answer, at L > n)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr,
-                                 const std::vector<int32_t>* written = nullptr, bool frontier = false) -> bool {
-            if ((!conversation_states && o.prompt_cache <= 0) || L < 1) return true;
+                                 const std::vector<int32_t>* written = nullptr) -> bool {
+            if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
-                if ((int64_t) c.ids.size() == L && !frontier) { c.used = ++check_clock; return true; }
+                if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
             if (written != nullptr) {
                 c.ids.assign(written->begin(), written->begin() + L);
@@ -7535,14 +7497,6 @@ int main(int argc, char** argv) {
                     c.stage_parts.push_back(std::move(part));
                 }
             }
-            if (conversation_states) {
-                using Running = strata::program::QwenStateCache::Running;
-                std::vector<Running> running{{&c.gdn, &c.ple, &c.tails}};
-                for (const auto& stage : c.stage_parts) running.push_back({&stage.gdn, &stage.ple, &stage.tails});
-                std::string error;
-                conversation_states->publish(conversation_prefix(c.ids, c.imgs), running, error, frontier);
-                if (!error.empty()) std::fprintf(stderr, "maya state cache: capture skipped (%s)\n", error.c_str());
-            }
             c.used = ++check_clock;
             checks.push_back(std::move(c));
             while ((int) checks.size() > o.prompt_cache) {
@@ -7561,30 +7515,8 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (one GPU: a layer split's drafter is on the last stage)
             const bool batched = !multi_gpu && sp.draft_kv(mtp, R_rows, nxt.data(), T, p0, e);
             if (!e.empty() || (!batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
-            // MTP has consumed this full chunk now. Interior stage exports can
-            // become complete recovery units using the matching residual row.
-            const int64_t done = p0 + T;
-            if (conversation_states) {
-                std::vector<std::pair<int64_t, std::vector<ConvCheckpoint>>> interior;
-                {
-                    std::lock_guard<std::mutex> lock(part_mu);
-                    for (auto it = part_at.begin(); it != part_at.end() && it->first < done;) {
-                        if (it->first > p0) interior.emplace_back(it->first, std::move(it->second));
-                        it = part_at.erase(it);
-                    }
-                }
-                for (auto& checkpoint : interior) {
-                    bool complete = checkpoint.second.size() == stages.size() + 1;
-                    for (const auto& part : checkpoint.second) complete = complete && !part.gdn.empty();
-                    if (!complete) continue;
-                    conversation_states->remember(checkpoint.first,
-                        R_rows + (checkpoint.first - p0 - 1) * g.hc * g.n_embd);
-                    if (!checkpoint_at(checkpoint.first, &checkpoint.second)) { e = "interior checkpoint assembly failed"; return false; }
-                    pp_next_check = checkpoint.first + o.prompt_cache_every;
-                }
-                conversation_states->remember(done, R_rows + (T - 1) * g.hc * g.n_embd);
-            }
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
+            const int64_t done = p0 + T;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f %lld\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0, (long long) pp_from);
@@ -7609,7 +7541,6 @@ int main(int argc, char** argv) {
                 }
                 if (!saved) { e = "saving a conversation checkpoint failed"; return false; }
                 pp_next_check = done + o.prompt_cache_every;
-                if (conversation_states && stages.empty()) part_next[0] = pp_next_check;
             }
             return true;
         };
@@ -7620,7 +7551,7 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
-                    if ((!conversation_states && o.prompt_cache <= 0) || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
+                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
                     part_next[i] = done + o.prompt_cache_every;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
@@ -7628,31 +7559,6 @@ int main(int argc, char** argv) {
                     auto& v = part_at[done];
                     v.resize(stages.size() + 1);
                     v[i] = std::move(part);
-                    return true;
-                };
-            }
-        }
-        if (conversation_states && o.prompt_cache_every > 0) {
-            for (size_t i = 0; i <= stages.size(); ++i) {
-                auto& stage = i == 0 ? sp : stages[i - 1]->sp;
-                stage.checkpoint_plan = [&, i](uint64_t start, uint64_t end) {
-                    const uint64_t mark = uint64_t(part_next[i]);
-                    std::vector<uint64_t> marks;
-                    if (mark > start && mark <= end) marks.push_back(mark);
-                    if (mark <= UINT64_MAX - uint64_t(o.prompt_cache_every) && mark + uint64_t(o.prompt_cache_every) <= end)
-                        marks.push_back(mark + uint64_t(o.prompt_cache_every));
-                    return strata::core::statecache::plan_export(start, end, marks, 1, true);
-                };
-                stage.on_stage_checkpoint = [&, i](strata::prefill::Prefill::Checkpoint checkpoint, std::string&) {
-                    ConvCheckpoint part;
-                    part.gdn = std::move(checkpoint.gdn);
-                    part.ple = std::move(checkpoint.ple);
-                    part.tails = std::move(checkpoint.tails);
-                    part_next[i] = checkpoint.position + o.prompt_cache_every;
-                    std::lock_guard<std::mutex> lock(part_mu);
-                    auto& parts = part_at[checkpoint.position];
-                    parts.resize(stages.size() + 1);
-                    parts[i] = std::move(part);
                     return true;
                 };
             }
@@ -8302,18 +8208,6 @@ int main(int argc, char** argv) {
                                  live.size(), (long long) k, (long long) resume, checks.size());
                 }
             }
-            if (conversation_states) {
-                std::vector<int32_t> prompt(cur.begin(), cur.end());
-                const int64_t old_resume = resume;
-                std::string error;
-                if (!conversation_states->restore(conversation_prefix(prompt, req_imgs), resume, from_live, error)) {
-                    checks.clear();
-                    std::fprintf(stderr, "maya state cache: restore missed (%s); recomputing\n", error.c_str());
-                } else if (resume > old_resume) {
-                    // Positional backing now belongs to this restored conversation.
-                    checks.clear();
-                }
-            }
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
             // (a checkpoint inside an earlier answer below `resume` is of no more use: this request writes the cells
@@ -8423,7 +8317,6 @@ int main(int argc, char** argv) {
                         return false;
                     }
                     if (!ver.commit(T, e) || !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)) return false;
-                    if (conversation_states) conversation_states->remember(q + T, ver.final_R_all() + (T - 1) * g.hc * g.n_embd);
                     q += T;
                 }
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
@@ -8628,11 +8521,8 @@ int main(int argc, char** argv) {
                 if (cuda_context_broken(err)) return 1;
                 continue;   // the experts are read again on demand: the next request runs
             }
-            if (!cancelled && conversation_states && n > 1 && !checkpoint_at(n - 1))
-                std::fprintf(stderr, "maya state cache: prompt frontier capture failed\n");
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
-            if (conversation_states) conversation_states->observe(uint64_t(read_from), uint64_t(n - 1), prompt_ms / 1000.);
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
             // the verify windows: the first holds the last prompt token alone
@@ -8778,14 +8668,6 @@ int main(int argc, char** argv) {
                     cancelled = true;   // the session is between two windows: the next request reads it again
                     break;
                 }
-                if (conversation_states) {
-                    conversation_states->remember(p + a + 1, ver.final_R_all() + a * g.hc * g.n_embd);
-                    if (a > 0 && !mtp.prefill(ver.final_R_all(), outv.data(), a, p, err)) {
-                        if (adapt_thr.joinable()) adapt_thr.join();
-                        std::printf("ERR state cache drafter catch-up: %s\n", err.c_str());
-                        return 1;
-                    }
-                }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
@@ -8912,9 +8794,7 @@ int main(int argc, char** argv) {
                 // (the checkpoints taken while reading it are still good)
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
-                live_ok = o.prompt_cache > 0 || bool(conversation_states);
-                if (conversation_states && !checkpoint_at(int64_t(live.size()), nullptr, &live, true))
-                    std::fprintf(stderr, "maya state cache: completed frontier capture failed\n");
+                live_ok = o.prompt_cache > 0;
             }
             if (window_failed) continue;   // the ERR was reported: the engine lives, the next request runs
             static const bool state_hash = std::getenv("MAYA_STATE_HASH") != nullptr;

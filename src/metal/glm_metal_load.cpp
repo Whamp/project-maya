@@ -5,12 +5,8 @@
 #include "ggml-cpu.h"
 
 #include <fcntl.h>
-#ifdef __APPLE__
 #include <mach/mach.h>
-#endif
-#ifdef __APPLE__
 #include <sys/sysctl.h>
-#endif
 #include <unistd.h>
 
 #include <algorithm>
@@ -104,16 +100,11 @@ struct Meta {
 // what the Mac could give this process now: free, inactive, purgeable and speculative pages (the dense weights and the
 // state are already allocated, so they are not in it)
 size_t free_memory() {
-#ifdef __APPLE__
     vm_statistics64_data_t vs{};
     mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &n) != KERN_SUCCESS) return SIZE_MAX;
     const uint64_t pages = (uint64_t) vs.free_count + vs.inactive_count + vs.purgeable_count + vs.speculative_count;
     return (size_t) (pages * (uint64_t) getpagesize());
-#else
-    const long pages = sysconf(_SC_AVPHYS_PAGES);
-    return pages > 0 ? size_t(pages) * size_t(getpagesize()) : 0;
-#endif
 }
 
 GlmMetal::Impl::~Impl() {
@@ -141,9 +132,7 @@ bool GlmMetal::Impl::open_files(const std::string& path, std::string& err) {
             err = "cannot open " + p;
             return false;
         }
-#ifdef F_NOCACHE
-        fcntl(fd, F_NOCACHE, 1);
-#endif   // the pool is the cache; the page cache would hold a second copy
+        fcntl(fd, F_NOCACHE, 1);   // the pool is the cache; the page cache would hold a second copy
         ggufs.push_back(c);
         metas.push_back(meta);
         fds.push_back(fd);
@@ -280,11 +269,9 @@ bool GlmMetal::Impl::init_backends(std::string& err) {
     int threads = o.cpu_threads;
     if (threads <= 0) {
         int perf = 0;
-#ifdef __APPLE__
         size_t sz = sizeof perf;
-        sysctlbyname("hw.perflevel0.physicalcpu", &perf, &sz, nullptr, 0);
-#endif
-        if (perf <= 0) perf = (int) std::max(1u, std::thread::hardware_concurrency());
+        if (sysctlbyname("hw.perflevel0.physicalcpu", &perf, &sz, nullptr, 0) != 0 || perf <= 0)
+            perf = (int) std::max(1u, std::thread::hardware_concurrency());
         threads = perf;
     }
     ggml_backend_cpu_set_n_threads(cpu, threads);
@@ -509,7 +496,7 @@ bool GlmMetal::Impl::init_experts(std::string& err) {
 bool GlmMetal::Impl::init_state(std::string& err) {
     const int kp = g.idx_kpool;
     const int64_t n_pools = n_ctx / kp + 1;
-    ggml_init_params ip{ggml_tensor_overhead() * (size_t) ((g.n_layers + 1) * 15 + 16), nullptr, true};
+    ggml_init_params ip{ggml_tensor_overhead() * (size_t) ((g.n_layers + 1) * 9 + 16), nullptr, true};
     sctx = ggml_init(ip);
     const int held = g.n_layers + (g.mtp ? 1 : 0);
     ls.assign((size_t) held, LayerState{});
@@ -523,12 +510,8 @@ bool GlmMetal::Impl::init_state(std::string& err) {
             s.ssm_snap = ggml_dup_tensor(sctx, s.ssm);
             if (o.max_window > 0) {
                 s.conv_win = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, g.d_conv - 1 + o.max_window, d_inner, 3);
-                s.ssm_before = ggml_dup_tensor(sctx, s.ssm);
-                s.win_q = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, g.kda_head_dim, g.n_head, o.max_window, 1);
-                s.win_k = ggml_dup_tensor(sctx, s.win_q);
-                s.win_v = ggml_dup_tensor(sctx, s.win_q);
-                s.win_g = ggml_dup_tensor(sctx, s.win_q);
-                s.win_beta = ggml_new_tensor_4d(sctx, GGML_TYPE_F32, 1, g.n_head, o.max_window, 1);
+                s.ssm_win = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, (int64_t) g.kda_head_dim * g.kda_head_dim * g.n_head,
+                                               o.max_window);
             }
         } else {
             // dsa_mm on the GPU rounds the gathered latent to half in mul_mm's tiles anyway: keeping it in F16 loses

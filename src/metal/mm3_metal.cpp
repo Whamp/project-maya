@@ -373,7 +373,6 @@ void Mm3Metal::set_options(const Mm3Options& o) { p_->o = o; }
 
 bool Mm3Metal::load(const std::string& path, int64_t max_ctx, std::string& err) {
     Impl& m = *p_;
-    m.model_path = path;
     if (max_ctx < 1 || m.o.n_ubatch < 1 || m.o.attn_chunk < 1) {
         err = "the context, the slice and the attention chunk need at least one token";
         return false;

@@ -605,7 +605,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_gpu_state STATIC src/core/state_io.cpp src/core/state_fingerprint.cu)
   target_include_directories(strata_gpu_state PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_gpu_state PUBLIC strata_state_cache ${_strata_gpu_runtime_target})
-  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/session_state_cache.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+  add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
     src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu)
@@ -706,14 +706,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
-  if(STRATA_BUILD_TESTS)
-    add_executable(gdn_checkpoint_export_test tests/gdn_checkpoint_export_test.cu)
-    target_include_directories(gdn_checkpoint_export_test PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(gdn_checkpoint_export_test PRIVATE strata_prefill ${_strata_gpu_runtime_target})
-    add_test(NAME gdn_checkpoint_export_test COMMAND gdn_checkpoint_export_test)
-    add_test(NAME gdn_checkpoint_export_serial COMMAND gdn_checkpoint_export_test serial)
-    set_tests_properties(gdn_checkpoint_export_test gdn_checkpoint_export_serial PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
-  endif()
 
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
@@ -891,7 +883,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                             src/mm3/mm3_host.cpp ${_mm3_nv_sources} ${_mm3_gguf_sources} ${_mm3_gguf_cpu_sources})
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3 third_party/ggml)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are; ggml-cpu's dots for a GGUF's experts)
-    target_link_libraries(maya-mm3 PRIVATE strata_gpu_state strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
                                            ${_strata_gpu_blas_target})
     # (ds4_iq.cu without the rest of maya-ds4: its dependent launch (src/ds4/ds4_pdl.cuh) and its AMD prompt experts'
     #  MMQ (MAYA_DS4_EXPERT_MMQ) left out - MiniMax's kernels launch as before)

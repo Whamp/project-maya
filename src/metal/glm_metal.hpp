@@ -13,7 +13,6 @@
 // slot.  A GPU never faults on file pages: on the M4 Max that path measured 12-29 MB/s, against 5+ GB/s for
 // parallel pread.
 #pragma once
-#include "strata/core/state_cache.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -120,7 +119,7 @@ public:
     void reset();
 
     // a verify window: `tokens` at the current position in one pass, `logits` receives every row's (T x n_vocab), the
-    // accepted recurrence is replayed from compact projections so accept(n) keeps exactly the first n tokens (1..T).
+    // recurrent state of every row is kept so that accept(n) can keep the first n tokens (1..T) and drop the rest.
     // Until accept() the position is past all T tokens.
     bool forward_window(const std::vector<int32_t>& tokens, std::vector<float>& logits, std::string& err);
     bool accept(int n, std::string& err);
@@ -160,12 +159,6 @@ public:
     void snapshot_save();
     bool snapshot_restore();          // false: no snapshot
     int64_t snapshot_position() const;  // -1: none
-    std::string state_identity() const;
-    std::string state_directory() const;
-    bool state_capture(strata::core::statecache::Capture&, const strata::core::statecache::Prefix&, std::string&) const;
-    bool state_restore(const strata::core::statecache::Prefix&, const std::vector<strata::core::statecache::Region>&, std::string&);
-    bool state_sources(const strata::core::statecache::Prefix&, std::vector<strata::core::statecache::RegionSource>&, std::string&) const;
-    bool state_load(strata::core::statecache::StateCache&, const strata::core::statecache::StateCache::Lease&, std::string&);
 
     const GlmGeometry& geometry() const;
     int64_t position() const;

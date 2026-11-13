@@ -143,7 +143,7 @@ __global__ void conv_residual_batch_kernel(const float* history, const float* no
     hidden[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], activation));
 }
 // the history after the chunk: the last nine normalized rows (older ones from the history when T < 9)
-__global__ void history_batch_kernel(const float* history, float* output, const float* normalized, int T) {
+__global__ void history_batch_kernel(float* history, const float* normalized, int T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= D) return;
     float h[HISTORY];
@@ -153,7 +153,7 @@ __global__ void history_batch_kernel(const float* history, float* output, const 
         h[r] = p >= 0 ? normalized[size_t(p) * D + c] : history[size_t(c) * HISTORY + (T + r)];
     }
 #pragma unroll
-    for (int r = 0; r < HISTORY; ++r) output[size_t(c) * HISTORY + r] = h[r];
+    for (int r = 0; r < HISTORY; ++r) history[size_t(c) * HISTORY + r] = h[r];
 }
 
 struct Span { const void* p; size_t bytes; size_t alignment; };
@@ -203,7 +203,7 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 }
 
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                              float* query_norm, float* gated, float* gate, int T, void* stream, float* checkpoint, int checkpoint_after) {
+                              float* query_norm, float* gated, float* gate, int T, void* stream) {
     if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate)
         throw std::invalid_argument("native PLE postops batch: null input or empty batch");
     auto st = static_cast<cudaStream_t>(stream);
@@ -215,9 +215,7 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
     broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
     rms_rep_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm);
     conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
-    if (checkpoint && checkpoint_after > 0 && checkpoint_after <= T)
-        history_batch_kernel<<<D / 256, 256, 0, st>>>(history, checkpoint, query_norm, checkpoint_after);
-    history_batch_kernel<<<D / 256, 256, 0, st>>>(history, history, query_norm, T);
+    history_batch_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T);
     launch_check();
 }
 } // namespace strata::kernels

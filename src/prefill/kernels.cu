@@ -240,7 +240,7 @@ __global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const floa
     }
 }
 // the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
-__global__ void gdn_conv_hist_kernel(const float* hist, float* output, const float* __restrict__ qkv, int64_t T) {
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) return;
     float v[3];
@@ -248,7 +248,7 @@ __global__ void gdn_conv_hist_kernel(const float* hist, float* output, const flo
         const int64_t t = T - 3 + k;
         v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
     }
-    output[c * 3] = v[0]; output[c * 3 + 1] = v[1]; output[c * 3 + 2] = v[2];
+    hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
 }
 __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     // block (t, head) over the 32 q/k heads, 128 threads
@@ -268,8 +268,7 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
                                                          const float* __restrict__ gate,
                                                          const float* __restrict__ beta, const float* __restrict__ z,
                                                          const float* __restrict__ gamma, float eps,
-                                                         float* __restrict__ y, uint16_t* __restrict__ y16, int64_t T,
-                                                         float* checkpoint, int64_t checkpoint_after) {
+                                                         float* __restrict__ y, uint16_t* __restrict__ y16, int64_t T) {
     __shared__ float sk[S], sq[S], red[RG][S], wsum[16];
     const int head = blockIdx.x, col = threadIdx.x, rg = threadIdx.y, tid = rg * S + col;
     const int qh = head % HK;
@@ -297,11 +296,6 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
         for (int r = 0; r < RPG; ++r) {
             s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
             o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        if (checkpoint && t + 1 == checkpoint_after) {
-            float* saved = checkpoint + ((size_t)(rg * RPG) * HV + head) * S + col;
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) saved[r * rs] = s[r];
         }
         __syncthreads();
         red[rg][col] = o;
@@ -333,8 +327,7 @@ constexpr int CB = 32, NCB = S / CB;
 __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                                 const float* __restrict__ gate,
                                                                 const float* __restrict__ beta,
-                                                                float* __restrict__ oc_out, int64_t T,
-                                                                float* checkpoint, int64_t checkpoint_after) {
+                                                                float* __restrict__ oc_out, int64_t T) {
     __shared__ float sk[S], sq[S], red[RG][CB];
     const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
     const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
@@ -362,11 +355,6 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict
         for (int r = 0; r < RPG; ++r) {
             s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
             o = fmaf(s[r], sq[rg * RPG + r], o);
-        }
-        if (checkpoint && t + 1 == checkpoint_after) {
-            float* saved = checkpoint + ((size_t)(rg * RPG) * HV + head) * S + col;
-#pragma unroll
-            for (int r = 0; r < RPG; ++r) saved[r * rs] = s[r];
         }
         __syncthreads();
         red[rg][c] = o;
@@ -660,27 +648,25 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     gdn_gates_kernel<<<blocks_for(T * HV), 256, 0, (cudaStream_t) stream>>>(ab, dt, ssm_a, gate, beta, T);
     check("gdn_gates");
 }
-void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream, float* checkpoint, int64_t checkpoint_after) {
-    if (checkpoint && checkpoint_after > 0 && checkpoint_after <= T)
-        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t)stream>>>(history, checkpoint, qkv, checkpoint_after);
+void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
     static const bool serial = std::getenv("MAYA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
     if (serial || T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
         gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
                                 (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
-        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, history, qkv, T);
+        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
     }
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, float* checkpoint, int64_t checkpoint_after) {
+                    const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
     static const bool serial = std::getenv("MAYA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
     if (serial || T <= 0) {
-        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, checkpoint, checkpoint_after);
+        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {
-        gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T, checkpoint, checkpoint_after);
+        gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
     }
     check("gdn_recurrence");

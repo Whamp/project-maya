@@ -28,14 +28,6 @@ public:
     TpEngine& operator=(const TpEngine&) = delete;
 
     bool load(const Options& o, std::string& err);
-    std::string state_identity() const;
-    std::string state_directory() const;
-    bool state_capture(strata::core::statecache::Capture& out, const strata::core::statecache::Prefix& prefix,
-                       std::string& error, size_t host_budget);
-    bool state_restore(const strata::core::statecache::Prefix& prefix,
-                       const std::vector<strata::core::statecache::Region>& regions, std::string& error);
-    bool state_sources(const strata::core::statecache::Prefix& prefix, std::vector<strata::core::statecache::RegionSource>& out, std::string& error);
-    bool state_load(strata::core::statecache::StateCache& cache, const strata::core::statecache::StateCache::Lease& lease, std::string& error);
     bool forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err);
     int vocab() const;
     int max_ctx() const;

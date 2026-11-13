@@ -3,7 +3,6 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
-#include "strata/core/state_io.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -319,8 +318,6 @@ struct Prefill::Impl {
     cudaEvent_t ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
     float* ple_norm = nullptr;
-    float* checkpoint_gpu = nullptr;
-    bool checkpoint_warned = false;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
     PrefillStats* stats = nullptr;
@@ -384,10 +381,6 @@ Prefill::~Prefill() {
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
-    if (impl_->checkpoint_gpu) {
-        const core::OnDevice on(impl_->device);
-        cudaFree(impl_->checkpoint_gpu);
-    }
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1087,45 +1080,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
-    int64_t chunk_done = 0;
-    for (int64_t c0 = 0; c0 < n; c0 += chunk_done) {
+    for (int64_t c0 = 0; c0 < n; c0 += m.T) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         if (std::getenv("MAYA_TRACE")) { std::fprintf(stderr, "maya trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
-        const int64_t p0 = pos0 + c0;
-        int64_t T = std::min(m.T, n - c0), checkpoint_after = 0;
-        const size_t rec_count = size_t(g.n_gdn_layers()) * gdn_floats;
-        const size_t ple_count = ss.ple_hist ? size_t(strata::kernels::NG_HIST) * strata::kernels::NG_HC_DIM : 0;
-        const size_t tail_size = size_t(s.idx_block - 1) * s.idx_dim;
-        const size_t tail_count = size_t(g.n_qsa_layers()) * tail_size;
-        std::vector<uint8_t> checkpoint_written(size_t(g.n_layers), 0);
-        bool checkpoint_ple = !ple_on;
-        if (checkpoint_plan && on_stage_checkpoint) {
-            const auto plan = checkpoint_plan(uint64_t(p0), uint64_t(p0 + T));
-            if (plan.end > uint64_t(p0) && plan.end <= uint64_t(p0 + T)) T = int64_t(plan.end) - p0;
-            if (plan.checkpoint > uint64_t(p0) && plan.checkpoint < uint64_t(p0 + T)) {
-                const size_t bytes = (rec_count + ple_count + tail_count) * sizeof(float);
-                const char* limit = std::getenv("MAYA_STATE_STAGING_MB");
-                const double megabytes = limit ? std::atof(limit) : 256.;
-                const bool fits = std::isfinite(megabytes) && megabytes > 0 && double(bytes) <= megabytes * 1048576.;
-                if (fits && (m.checkpoint_gpu || cudaMalloc(&m.checkpoint_gpu, bytes) == cudaSuccess)) {
-                    checkpoint_after = int64_t(plan.checkpoint) - p0;
-                    bool copied = cudaMemcpyAsync(m.checkpoint_gpu, ss.gdn_state, rec_count * 4, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess;
-                    if (ple_count) copied = cudaMemcpyAsync(m.checkpoint_gpu + rec_count, ss.ple_hist, ple_count * 4, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess && copied;
-                    for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
-                        copied = cudaMemcpyAsync(m.checkpoint_gpu + rec_count + ple_count + size_t(i) * tail_size,
-                                        ss.qsa_states[i].idx_tail, tail_size * 4, cudaMemcpyDeviceToDevice, m.cs) == cudaSuccess && copied;
-                    if (!copied) { err = "prefill: checkpoint backing copy failed"; return false; }
-                } else {
-                    cudaGetLastError();
-                    T = int64_t(plan.checkpoint) - p0;
-                    if (!m.checkpoint_warned) {
-                        std::fprintf(stderr, "maya state cache: Qwen export staging unavailable; using exact prefill cuts\n");
-                        m.checkpoint_warned = true;
-                    }
-                }
-            }
-        }
-        chunk_done = T;
+        const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
@@ -1194,9 +1152,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs);
             cudaEventRecord(m.ple_copied[ple_buf], m.cs);
-            if (c0 + T < n) {
+            if (c0 + m.T < n) {
                 cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]);   // the other buffer's upload (a chunk ago) is done
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + T, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + m.T, b = ple_buf ^ 1] {
                     return ple_gather(c1, b, ple_next_err);
                 });
             }
@@ -1366,11 +1324,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     try {
                         strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
-                                                                  gate, (int) nb, m.cs,
-                                                                  checkpoint_after > s0 && checkpoint_after <= s0 + nb
-                                                                      ? m.checkpoint_gpu + rec_count : nullptr,
-                                                                  int(checkpoint_after - s0));
-                        if (checkpoint_after > s0 && checkpoint_after <= s0 + nb) checkpoint_ple = true;
+                                                                  gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
                 stats_.ms_ple += ms_since(tp);
@@ -1386,13 +1340,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                    ss.ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                     strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
-                    if (checkpoint_after && t + 1 == checkpoint_after) {
-                        if (cudaMemcpyAsync(m.checkpoint_gpu + rec_count, ss.ple.hist, ple_count * 4,
-                                            cudaMemcpyDeviceToDevice, m.cs) != cudaSuccess) {
-                            err = "prefill: PLE checkpoint copy failed"; return false;
-                        }
-                        checkpoint_ple = true;
-                    }
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -1432,14 +1379,9 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    float* exported = checkpoint_after ? m.checkpoint_gpu + size_t(gdn_index) * gdn_floats : nullptr;
-                    const size_t matrix = size_t(g.ssm_state_size) * g.ssm_v_heads * g.ssm_state_size;
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs,
-                             exported ? exported + matrix : nullptr, checkpoint_after);
+                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   exported, checkpoint_after);
-                    if (checkpoint_after) checkpoint_written[size_t(l)] = 1;
+                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
@@ -1502,11 +1444,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
                     // the queries below read it only after the whole chunk is appended). MAYA_INDEXER_PER_TOKEN=1: the old
                     try {
-                        if (checkpoint_after) {
-                            strata::kernels::native_qsa_indexer_export_tail(m.idx_raw, checkpoint_after, p0, st.idx_tail,
-                                m.checkpoint_gpu + rec_count + ple_count + size_t(qsa_index) * tail_size, m.cs);
-                            checkpoint_written[size_t(l)] = 1;
-                        }
                         static const bool per_token = std::getenv("MAYA_INDEXER_PER_TOKEN") != nullptr;
                         if (!per_token) {
                             strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
@@ -1962,27 +1899,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             stats_.ms_experts_host += iss_ms;
             stats_.experts_streamed += iss_streamed;
             stats_.experts_dma += iss_dma;
-        }
-        if (checkpoint_after) {
-            bool complete = checkpoint_ple;
-            for (int64_t layer = LB; layer < LE; ++layer) complete = complete && checkpoint_written[size_t(layer)];
-            if (!complete) { err = "prefill: not every checkpoint component was written"; return false; }
-            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = "prefill: checkpoint stream failed"; return false; }
-            namespace sc = core::statecache;
-            std::vector<sc::MemoryRegion> memory{
-                {"gdn", {{m.checkpoint_gpu, rec_count * 4}}},
-                {"ple", {{m.checkpoint_gpu + rec_count, ple_count * 4}}},
-                {"tails", {{m.checkpoint_gpu + rec_count + ple_count, tail_count * 4}}}};
-            std::vector<sc::Region> regions;
-            std::string error;
-            if (sc::capture_memory(memory, regions, error, size_t(sc::Config::environment().ram_bytes))) {
-                Checkpoint checkpoint;
-                checkpoint.position = p0 + checkpoint_after;
-                checkpoint.gdn = std::move(regions[0].bytes);
-                checkpoint.ple = std::move(regions[1].bytes);
-                checkpoint.tails = std::move(regions[2].bytes);
-                if (!on_stage_checkpoint(std::move(checkpoint), err)) return false;
-            } else std::fprintf(stderr, "maya state cache: interior checkpoint skipped (%s)\n", error.c_str());
         }
         stats_.tokens += T;
         pt.mark(kPfStart, cs);

@@ -26,7 +26,6 @@ struct Mm3Metal::Impl {
     Mm3Options o;
     Mm3Geometry g;
     Mm3Stats st;
-    std::string model_path;
 
     // files: the main shards plus the indexers' side file when the set has one
     std::vector<gguf_context*> ggufs;

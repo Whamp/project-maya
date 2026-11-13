@@ -33,7 +33,6 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 /// the normalized gated values), `gated` (T x 10240) and `gate` (T x 4) are scratch; `history` (9 rows per
 /// channel) is advanced past the T tokens.
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                              float* query_norm, float* gated, float* gate, int T, void* stream,
-                              float* checkpoint = nullptr, int checkpoint_after = 0);
+                              float* query_norm, float* gated, float* gate, int T, void* stream);
 
 } // namespace strata::kernels

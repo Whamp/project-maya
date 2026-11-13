@@ -29,32 +29,6 @@ BLOB = 3 * (H * FF * 18 // 64)
 Q8 = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
       "self_attn.v_proj.weight", "self_attn.o_proj.weight", "self_attn.indexer.index_qk_proj.weight",
       "mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"}
-NORMS = {"pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight", "self_attn.k_norm.weight",
-         "self_attn.q_norm.weight", "attn_hyper_connection.hc_norm.weight", "mlp_hyper_connection.hc_norm.weight",
-         "hyper_connection_mixer.hc_norm.weight"}
-
-
-def dense_tensor(short, tensor_type, data):
-    """Interpret each source tensor by its own artifact dtype.
-
-    Conversion of the listed large projections to Q8 is deliberate. Other
-    quantization metadata never changes the interpretation of BF16 bytes.
-    """
-    data = np.asarray(data)
-    if tensor_type == 0 and short in NORMS:
-        arr = data.astype("<f4") + np.float32(1)
-        return arr.tobytes(), "f32", 1, arr.size
-    if tensor_type != 30:
-        raise ValueError(f"{short}: expected {'F32 Gemma norm' if short in NORMS else 'BF16'}, got GGML type {tensor_type}")
-    if short in NORMS:
-        raise ValueError(f"{short}: BF16 norm needs an explicit supported conversion")
-    if data.nbytes % 2: raise ValueError(f"{short}: incomplete BF16 payload")
-    u16 = data.view("<u2").reshape(data.shape[0], -1)
-    rows, cols = u16.shape
-    if short in Q8:
-        f32 = (u16.astype("<u4") << 16).view("<f4")
-        return q8_0(f32), "q8_0", rows, cols
-    return u16.tobytes(), "bf16", rows, cols
 
 
 def q8_0(x: np.ndarray) -> bytes:
@@ -108,7 +82,18 @@ def main() -> int:
             short = name[len("mtp."):]
             short = short[len("layers.0."):] if short.startswith("layers.0.") else short
             data = np.asarray(t.data)
-            raw, kind, rows, cols = dense_tensor(short, int(t.tensor_type), data)
+            if int(t.tensor_type) == 0:        # F32 norm weights: raw GemmaRMSNorm w -> 1 + w
+                arr = (data.astype(np.float32) + 1.0)
+                raw, kind, rows, cols = arr.tobytes(), "f32", 1, arr.size
+            else:                              # BF16
+                u16 = data.view(np.uint16) if data.dtype != np.uint16 else data
+                u16 = u16.reshape(data.shape[0], -1)
+                rows, cols = u16.shape
+                if short in Q8:
+                    f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+                    raw, kind = q8_0(f32), "q8_0"
+                else:
+                    raw, kind = u16.tobytes(), "bf16"
             pad = (-off) % 256
             f.write(b"\0" * pad)
             off += pad

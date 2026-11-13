@@ -10,7 +10,6 @@
 // blocks from those scores exactly as ref.py's msa_select does, and the second runs the sparse attention
 // and the MLP with every expert resident (the Maya quants are built to fit a 128 GB Mac whole).
 #pragma once
-#include "strata/core/state_cache.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -64,12 +63,6 @@ class Mm3Metal {
     void snapshot_save();
     bool snapshot_restore();
     int64_t snapshot_position() const;
-    std::string state_identity() const;
-    std::string state_directory() const;
-    bool state_capture(strata::core::statecache::Capture&, const strata::core::statecache::Prefix&, std::string&) const;
-    bool state_restore(const strata::core::statecache::Prefix&, const std::vector<strata::core::statecache::Region>&, std::string&);
-    bool state_sources(const strata::core::statecache::Prefix&, std::vector<strata::core::statecache::RegionSource>&, std::string&) const;
-    bool state_load(strata::core::statecache::StateCache&, const strata::core::statecache::StateCache::Lease&, std::string&);
     int ubatch() const;
     // appends ids at the current position; logits (n_vocab) of the last token
     bool forward(const std::vector<int32_t>& ids, std::vector<float>& logits, std::string& err);
