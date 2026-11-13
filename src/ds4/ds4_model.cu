@@ -11,6 +11,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "strata/core/state_io.hpp"
 #include "ds4_borrow.hpp"
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_ablate.hpp"
@@ -9899,6 +9900,153 @@ struct Model::Impl {
         return true;
     }
 
+    using StateMemory = std::map<int, std::vector<core::statecache::MemoryRegion>>;
+    StateMemory state_memory(int64_t n, const Check* checkpoint, bool loading) {
+        StateMemory memory;
+        const auto add = [&](int device, std::string name, void* ptr, size_t bytes, bool rows = false) {
+            memory[device].push_back({std::move(name), {{ptr, bytes}}, rows});
+        };
+        for (size_t i = 0; i < L.size(); ++i) {
+            for (int m = 0; m < (loading ? L[i].nm : 1); ++m) {
+                Layer& layer = member(L[i], m);
+                const std::string name = "layer-" + std::to_string(i);
+                auto* window = checkpoint ? const_cast<uint8_t*>(checkpoint->win[i].data()) : layer.win;
+                const size_t wb = size_t(std::min<int64_t>(n, g.win)) * win_rb();
+                add(layer.dev, name + "/window", window, wb);
+                if (layer.c_kv) {
+                    const size_t cb = size_t(n % layer.ratio) * g.hd * sizeof(float);
+                    auto* kv = checkpoint ? const_cast<float*>(checkpoint->comp[2 * i].data()) : layer.c_kv;
+                    auto* score = checkpoint ? const_cast<float*>(checkpoint->comp[2 * i + 1].data()) : layer.c_score;
+                    add(layer.dev, name + "/partial-kv", kv, cb);
+                    add(layer.dev, name + "/partial-score", score, cb);
+                }
+            }
+        }
+        for (size_t i = 0; i < srcs.size(); ++i) {
+            const auto& source = srcs[i];
+            const size_t rows = size_t(n / std::max(1, source.ratio));
+            const size_t owner = size_t(L[size_t(source.layer)].dev);
+            size_t kv_owner = owner, index_owner = owner;
+            if (!source.ckv[kv_owner]) for (size_t di = 0; di < devs.size(); ++di)
+                if (source.ckv[di]) { kv_owner = di; break; }
+            if (!source.ik[index_owner]) for (size_t di = 0; di < devs.size(); ++di)
+                if (source.ik[di]) { index_owner = di; break; }
+            for (size_t di = 0; di < devs.size(); ++di) {
+                if ((loading || di == kv_owner) && source.ckv[di])
+                    add(int(di), "source-" + std::to_string(i) + "/kv", source.ckv[di], rows * ckv_rb(), true);
+                if ((loading || di == index_owner) && source.ik[di])
+                    add(int(di), "source-" + std::to_string(i) + "/index", source.ik[di], rows * ik_rb(), true);
+            }
+        }
+        return memory;
+    }
+    bool state_sources(const core::statecache::Prefix& prefix, std::vector<core::statecache::RegionSource>& out,
+                       std::string& err) {
+        namespace sc = core::statecache;
+        const int64_t n = int64_t(prefix.tokens.size());
+        if (n <= 0 || n > pos || prefix.tokens.size() > toks.size() ||
+            !std::equal(prefix.tokens.begin(), prefix.tokens.end(), toks.begin())) {
+            err = "DeepSeek checkpoint tokens do not match live state"; return false;
+        }
+        const Check* checkpoint = nullptr;
+        if (n != pos) {
+            for (int k : slot_checks()) if (check_at(k).pos == n) checkpoint = &check_at(k);
+            if (!checkpoint) { err = "DeepSeek running state unavailable at endpoint"; return false; }
+        }
+        const auto layout = state_identity();
+        out.clear(); out.push_back(sc::bytes_source("layout", sc::Bytes(layout.begin(), layout.end())));
+        auto transfer = sc::memory_transfer();
+        for (const auto& [di, memory] : state_memory(n, checkpoint, false)) {
+            cudaSetDevice(devs[size_t(di)].id);
+            if (cudaStreamSynchronize(devs[size_t(di)].st) != cudaSuccess ||
+                !sc::memory_sources(memory, devs[size_t(di)].id, transfer, out, err)) {
+                if (err.empty()) err = "DeepSeek capture stream failed";
+                return false;
+            }
+        }
+        return true;
+    }
+    bool state_load(core::statecache::StateCache& cache, const core::statecache::StateCache::Lease& lease,
+                    std::string& err) {
+        namespace sc = core::statecache;
+        const int64_t n = int64_t(lease.tokens());
+        const auto identity = state_identity();
+        sc::Bytes layout;
+        if (n <= 0 || n > o.max_context || !cache.read_region(lease, "layout", layout, err, identity.size()) ||
+            std::string(layout.begin(), layout.end()) != identity) {
+            if (err.empty()) err = "DeepSeek checkpoint layout mismatch";
+            return false;
+        }
+        reset();
+        auto transfer = sc::memory_transfer();
+        std::vector<sc::RegionTarget> targets{sc::check_region("layout", std::move(layout))};
+        for (const auto& [di, memory] : state_memory(n, nullptr, true))
+            if (!sc::memory_targets(memory, devs[size_t(di)].id, transfer, targets, err, true)) { reset(); return false; }
+        if (!cache.restore(lease, targets, err)) { reset(); return false; }
+        pos = n; toks = lease.prefix().tokens; ctoks.resize(size_t(n));
+        for (size_t i = 0; i < size_t(n); ++i)
+            ctoks[i] = img_tok >= 0 && toks[i] == img_tok ? -1 : (toks[i] < pk.eg_vocab ? pk.eg_map[size_t(toks[i])] : 0);
+        imgs.clear(); slot_held = false; return true;
+    }
+    bool state_capture(core::statecache::Capture& out, const core::statecache::Prefix& prefix,
+                       std::string& err, size_t budget) {
+        namespace sc = core::statecache;
+        out = {};
+        const int64_t n = int64_t(prefix.tokens.size());
+        if (n <= 0 || n > pos || prefix.tokens.size() > toks.size() ||
+            !std::equal(prefix.tokens.begin(), prefix.tokens.end(), toks.begin())) {
+            err = "DeepSeek checkpoint tokens do not match live state"; return false;
+        }
+        const Check* checkpoint = nullptr;
+        if (n != pos) {
+            for (int k : slot_checks()) if (check_at(k).pos == n) checkpoint = &check_at(k);
+            if (!checkpoint) { err = "DeepSeek running state is not available at endpoint"; return false; }
+        }
+        sc::Capture capture; capture.prefix = prefix;
+        const std::string identity = state_identity();
+        if (identity.size() > budget) return false;
+        budget -= identity.size();
+        capture.regions.push_back({"layout", sc::Bytes(identity.begin(), identity.end())});
+        auto views = state_memory(n, checkpoint, false);
+        for (auto& [di, regions] : views) {
+            cudaSetDevice(devs[size_t(di)].id);
+            if (cudaStreamSynchronize(devs[size_t(di)].st) != cudaSuccess) { err = "DeepSeek capture stream failed"; return false; }
+            std::vector<sc::Region> bytes;
+            if (!sc::capture_memory(regions, bytes, err, budget)) return false;
+            for (auto& region : bytes) { budget -= region.bytes.size(); capture.regions.push_back(std::move(region)); }
+        }
+        out = std::move(capture); return true;
+    }
+    bool state_restore(const core::statecache::Prefix& prefix, const std::vector<core::statecache::Region>& payload,
+                       std::string& err) {
+        namespace sc = core::statecache;
+        const int64_t n = int64_t(prefix.tokens.size());
+        const auto layout = std::find_if(payload.begin(), payload.end(), [](const auto& r) { return r.name == "layout"; });
+        if (n <= 0 || n > o.max_context || layout == payload.end() ||
+            std::string(layout->bytes.begin(), layout->bytes.end()) != state_identity()) {
+            err = "DeepSeek checkpoint layout mismatch"; return false;
+        }
+        // Every native member gets the source's complete backing. No source is
+        // considered restored until copies on all its devices have completed.
+        reset();
+        for (auto& [di, memory] : state_memory(n, nullptr, true)) {
+            cudaSetDevice(devs[size_t(di)].id);
+            std::vector<sc::Region> regions;
+            for (const auto& view : memory) {
+                const auto found = std::find_if(payload.begin(), payload.end(), [&](const auto& r) { return r.name == view.name; });
+                if (found == payload.end()) { err = "DeepSeek checkpoint member missing"; reset(); return false; }
+                regions.push_back(*found);
+            }
+            if (!sc::restore_memory(memory, regions, err)) { reset(); return false; }
+        }
+        pos = n; toks = prefix.tokens;
+        ctoks.resize(size_t(n));
+        for (size_t i = 0; i < size_t(n); ++i)
+            ctoks[i] = img_tok >= 0 && toks[i] == img_tok ? -1 : (toks[i] < pk.eg_vocab ? pk.eg_map[size_t(toks[i])] : 0);
+        imgs.clear(); slot_held = false;
+        return true;
+    }
+
     // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
     // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
     // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
@@ -10295,6 +10443,17 @@ struct Model::Impl {
         return true;
     }
 
+    std::string state_identity() const {
+        std::ostringstream id; std::error_code error;
+        id << slot_identity() << " pack=" << std::filesystem::absolute(pk.dir).string();
+        id << " rows=" << win_rb() << "," << ckv_rb() << "," << ik_rb() << " layers=";
+        for (const auto& layer : L) id << layer.dev << "/" << layer.nm << ",";
+        for (const char* file : {"ds4.txt", "engram.bin", "tensors.txt"})
+            id << " " << file << ":" << std::filesystem::last_write_time(std::filesystem::path(pk.dir)/file, error).time_since_epoch().count();
+        for (const auto& file : pk.files)
+            id << " " << file << ":" << std::filesystem::last_write_time(std::filesystem::path(pk.model_dir)/file, error).time_since_epoch().count();
+        return id.str();
+    }
     std::string slot_identity() const {
         const auto size_of = [](const std::string& p) {
             std::error_code ec;
@@ -22980,6 +23139,20 @@ bool Model::verify_multi(int i, const std::vector<int>& d, float t, float tp, in
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+bool Model::state_commit(int64_t endpoint, std::string& err) {
+    auto& m = *p_;
+    if (endpoint == m.pos) return true;
+    if (endpoint <= 0 || endpoint > m.pos || size_t(endpoint) > m.toks.size()) {
+        err = "DeepSeek committed endpoint is unavailable"; return false;
+    }
+    // Accepted drafts may already have advanced the compressors/ring past a
+    // stop token. Rebuild from an actual recurrence checkpoint, never relabel it.
+    std::vector<int> tokens(m.toks.begin(), m.toks.begin() + endpoint);
+    if (!m.restore(endpoint)) { err = "DeepSeek commit has no earlier checkpoint"; return false; }
+    const int64_t start = m.pos;
+    if (start < endpoint && !feed(tokens.data() + start, int(endpoint-start), 0, err)) { reset(); return false; }
+    return m.pos == endpoint;
+}
 void Model::pin() { p_->pin(); }
 void Model::mark(bool shared) { p_->mark(shared); }
 int Model::marks_cap() const { return Impl::marks_cap(); }
@@ -22993,6 +23166,18 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     return p_->slot_load(data, bytes, n_pos, err, pics);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
+std::string Model::state_identity() const { return p_->state_identity(); }
+bool Model::state_capture(core::statecache::Capture& out, const core::statecache::Prefix& prefix,
+                          std::string& err, size_t budget) { return p_->state_capture(out, prefix, err, budget); }
+bool Model::state_restore(const core::statecache::Prefix& prefix,
+                          const std::vector<core::statecache::Region>& regions, std::string& err) {
+    return p_->state_restore(prefix, regions, err);
+}
+bool Model::state_sources(const core::statecache::Prefix& prefix, std::vector<core::statecache::RegionSource>& out,
+                          std::string& err) { return p_->state_sources(prefix, out, err); }
+bool Model::state_load(core::statecache::StateCache& cache, const core::statecache::StateCache::Lease& lease,
+                       std::string& err) { return p_->state_load(cache, lease, err); }
+
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 std::string Model::describe() const { return p_->describe(); }
