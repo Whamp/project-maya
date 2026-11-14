@@ -92,6 +92,27 @@ class Engine:
                 self.offered += int(fields[8 if self.parallel > 1 else 7])
                 return tokens, int(fields[9 if self.parallel > 1 else 8])
 
+    def generate_together(self, requests):
+        """Several GEN lines at once (--parallel): {rid: (tokens, reuse)} once every one is DONE."""
+        for rid, (prompt, n) in requests.items():
+            self.input.write(
+                f"GEN {n} rid={rid} spec={self.spec} spec_min_p=0 {','.join(map(str, prompt))}\n".encode()
+            )
+        self.input.flush()
+        tokens = {rid: [] for rid in requests}
+        done = {}
+        while len(done) < len(requests):
+            line = self.line()
+            if line.startswith("T "):
+                _, rid, token = line.split()
+                tokens[int(rid)].append(int(token))
+            elif line.startswith("ERR"):
+                raise RuntimeError(line)
+            elif line.startswith("DONE "):
+                fields = line.split()
+                done[int(fields[1])] = (tokens[int(fields[1])], int(fields[9]))
+        return done
+
     def close(self):
         if self.process.poll() is None:
             self.input.write(b"QUIT\n")
@@ -184,6 +205,17 @@ def main():
                 reuse,
                 len(prompt) - 1,
             )
+            # prompts read while another request decodes, one of them ending at its first token: each prompt's
+            # state is published after that token (or at the end), and a later request restores it from the cache
+            first = list(range(200, 237))
+            second = list(range(240, 277))
+            done = multi.generate_together({6: (first, 8), 7: (second, 1)})
+            assert len(done[7][0]) == 1, done
+            for rid, start in enumerate([300, 340, 380], 8):   # (the two contexts hold other conversations now)
+                multi.generate(list(range(start, start + 37)), rid=rid)
+            for rid, tokens in ((11, first), (12, second)):
+                result, reuse = multi.generate(tokens, rid=rid)
+                assert reuse == len(tokens) - 1, (rid, reuse, len(tokens) - 1)
             multi.close()
             engines.remove(multi)
             if not args.skip_migration:
