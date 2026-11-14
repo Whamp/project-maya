@@ -4,7 +4,7 @@
 
 Each `--exe` (optionally `PATH:KEY=VALUE,...` for its own environment, e.g. `build/maya:MAYA_STATE_CACHE=0`) starts
 once per round and answers `--requests` fresh prompts of `--prompt` tokens, `--output` tokens each (greedy, the
-end-of-text tokens banned), one after another as an agent's turns come. The first `--warm` requests are left out.
+end-of-text tokens banned), one after another (`--pause` seconds apart, as an agent's tools run between its turns). The first `--warm` requests are left out.
 Rounds alternate the builds' order. Per request: the first-token time, the decode rate from the first token to the
 last (the engine's own T line times), the median gap between tokens, and the engine's `glm stat` line (RAM fetches and
 promotions per token: whether background expert moves lagged).
@@ -66,6 +66,8 @@ def run(spec: str, round_: int, args: argparse.Namespace, config: dict, tok) -> 
         try:
             for i in range(args.requests):
                 prompt = text_tokens(tok, f"Round {round_} request {i}", args.prompt)
+                if i and args.pause:
+                    time.sleep(args.pause)   # (an agent's tools run between its turns)
                 rows.append(ask(engine, prompt, args))
         finally:
             engine.quit(timeout=300)
@@ -89,6 +91,7 @@ def main() -> int:
     p.add_argument("--output", type=int, default=256)
     p.add_argument("--spec", type=int, default=0, help="GEN spec=N (1: no drafting); 0: the engine's default")
     p.add_argument("--ban-eos", default="154820:-100,154827:-100,154829:-100")
+    p.add_argument("--pause", type=float, default=0, help="seconds between requests (0: back to back)")
     p.add_argument("--timeout", type=float, default=600)
     p.add_argument("--out", required=True)
     args = p.parse_args()

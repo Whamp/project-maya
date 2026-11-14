@@ -27,8 +27,9 @@ state does not grow with its length. A state is named by its token prefix; publi
 nothing, and the eviction policy decides whether a new state is kept before anything is copied. On SSD each chunk
 keeps its fingerprint, and a load that does not match fails as a whole; the engine then reads the prompt again.
 
-With one conversation at a time, the prompt's state is saved right after the first token, so the copy is not part of
-the time to first token.
+The prompt's state is saved when the request ends, after its last token and just before the answer's own state, so
+its copy (about 150 MiB of whole buffers on GLM-5.3-Flash) is neither in the time to first token nor in the answer.
+A request that comes while it runs waits for it; an agent's next turn, which comes after its tools ran, does not.
 
 ## Controls
 
