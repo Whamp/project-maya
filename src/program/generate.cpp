@@ -1945,6 +1945,7 @@ static int glm_pack_generate(const Options& o) {
         bool keep = false;
         std::vector<strata::core::statecache::ExtraInput> extra;
         uint64_t image_hash = kNoImages;
+        std::vector<int32_t> pending_snap;   // its prompt's snapshot, not yet published
     };
     std::vector<DeferredPause> deferred_pauses;
     std::function<void()> gap_reset;
@@ -1956,8 +1957,10 @@ static int glm_pack_generate(const Options& o) {
             for (const auto& pv : model.pool_vram()) d.push_back(pv.dev);
         return d;
     };
-    // One request at a time, the prompt's snapshot is published once its first token is out, not before (the
-    // snapshot buffer and the rows before it stay as they are until the request's end saves the next one).
+    // The prompt's snapshot is published at the request's end, after its DONE line and just before the answer's own
+    // state (the snapshot buffer and the rows before it stay as they are until then): its copy (the whole buffers,
+    // ~150 MiB on GLM-5.3-Flash) is neither in the time to the first token nor in the decode, where it would compete
+    // with expert staging for PCIe. Several conversations at once keep it on the request (Gen::pending_snap).
     bool defer_snapshot = false;
     std::vector<int32_t> pending_snapshot;
     const auto publish_pending = [&] {
@@ -2493,7 +2496,6 @@ static int glm_pack_generate(const Options& o) {
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
             ++produced;
-            if (produced == 1 && !pending_snapshot.empty()) { std::fflush(stdout); publish_pending(); }
             emitted.push_back((int32_t) tok);
             if (sp.host_history != nullptr) pen_hist.push_back((int32_t) tok);   // (fed next: the picks after count it)
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
@@ -2665,7 +2667,7 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
-        publish_pending();   // (a request that wrote no token)
+        publish_pending();   // (after DONE: the client has its answer)
         if (state_cache || (pause_req.load() && std::strcmp(finish, "cancel") == 0))
             pause_snapshot(prompt, emitted, pause_req.load() && pause_keep.load());
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
@@ -2800,6 +2802,7 @@ static int glm_pack_generate(const Options& o) {
         int32_t force = -1;      // the next token instead of the sampled one (the thinking budget, the loop guard)
         int32_t pending = -1;    // written, not fed yet
         bool ready = false;      // just admitted: the first sample's logits are on the tail
+        std::vector<int32_t> pending_snap;   // its prompt's snapshot, published at its end
         bool inflight = false, done = false, pause = false, keep = false;
         const char* finish = "length";
         size_t reuse = 0;
@@ -2870,6 +2873,16 @@ static int glm_pack_generate(const Options& o) {
     };
     // one written token of a request: its T line, the loop guard and the thinking budget (as run_request's
     // on_token), the stop conditions.  false: the request ends here (g.finish says why)
+    // its prompt's snapshot, at its end (gen_finish, flush_pauses: the caller bound its context)
+    const auto publish_prompt = [&](Gen& g) {
+        if (g.pending_snap.empty()) return;
+        const auto tokens = std::move(g.pending_snap);
+        g.pending_snap.clear();
+        if (tokens == snap_tokens) {
+            std::fflush(stdout);
+            state_publish(tokens);
+        }
+    };
     const auto gen_token = [&](Gen& g, int tok) -> bool {
         std::printf("T %d %d\n", g.rid, tok);
         ++g.produced;
@@ -2975,6 +2988,7 @@ static int glm_pack_generate(const Options& o) {
     const auto flush_pauses = [&] {
         for (const auto& d : deferred_pauses) {
             bind_ctx(d.ctx);
+            if (!d.pending_snap.empty() && d.pending_snap == snap_tokens) state_publish(d.pending_snap);
             pause_snapshot(d.prompt, d.emitted, d.keep, &d.extra, d.image_hash);
             ctxs[(size_t) d.ctx].busy = false;
         }
@@ -3003,10 +3017,12 @@ static int glm_pack_generate(const Options& o) {
         bool deferred = false;
         if (state_cache || (g.pause && std::strcmp(g.finish, "cancel") == 0)) {
             if (in_read_gap) {   // (another context's prompt is being read and stays bound: the snapshot after it)
-                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep, std::move(g.state_extra), g.state_image_hash});
+                deferred_pauses.push_back({g.ctx, g.prompt, g.emitted, g.keep, std::move(g.state_extra), g.state_image_hash,
+                                           std::move(g.pending_snap)});
                 deferred = true;
             } else {
                 bind_ctx(g.ctx);
+                publish_prompt(g);   // (after DONE: its prompt's snapshot before the end's)
                 pause_snapshot(g.prompt, g.emitted, g.keep, &g.state_extra, g.state_image_hash);
             }
         }
@@ -3400,7 +3416,12 @@ static int glm_pack_generate(const Options& o) {
         }
         admit_stop.store(false);
         admitting_rid.store(rid);
+        pending_snapshot.clear();
+        defer_snapshot = true;
         const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
+        defer_snapshot = false;
+        g->pending_snap = std::move(pending_snapshot);
+        pending_snapshot.clear();
         admitting_rid.store(-1);
         prompt_piece = nullptr;
         prompt_between = nullptr;
